@@ -1,9 +1,16 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { discoverClaudeModels, loginClaudeCode, rewriteInitialRequest, runClaudeRequest } from "../src/claude-cli.ts";
+import {
+  cachedClaudeProcessCount,
+  closeClaudeProcesses,
+  discoverClaudeModels,
+  loginClaudeCode,
+  rewriteInitialRequest,
+  runClaudeRequest,
+} from "../src/claude-cli.ts";
 import { createClaudeCodeProvider } from "../src/provider.ts";
 
 test("stabilizes Claude Code's native replay reminders and cache breakpoint", () => {
@@ -142,7 +149,7 @@ test("runs a request through a stream-json Claude executable", async () => {
     executable,
     `#!/usr/bin/env node
 import readline from "node:readline";
-import {readFileSync} from "node:fs";
+import {appendFileSync, readFileSync} from "node:fs";
 if (process.argv.includes("auth") && process.argv.includes("status")) {
   console.log(JSON.stringify({loggedIn: true, authMethod: "claude.ai", subscriptionType: "test"}));
   process.exit(0);
@@ -162,11 +169,13 @@ if (process.argv.includes("auth") && process.argv.includes("login")) {
   process.exit(3);
 }
 if (process.cwd() !== process.env.EXPECTED_CWD) throw new Error(\`wrong cwd: \${process.cwd()}\`);
+if (process.env.PROCESS_LOG) appendFileSync(process.env.PROCESS_LOG, \`\${process.pid}\\n\`);
 const systemIndex = process.argv.indexOf("--system-prompt-file");
 if (systemIndex >= 0 && readFileSync(process.argv[systemIndex + 1], "utf8") !== process.env.EXPECTED_SYSTEM_PROMPT) {
   throw new Error("wrong system prompt");
 }
 const input = readline.createInterface({input: process.stdin, crlfDelay: Infinity});
+let queryCount = 0;
 for await (const line of input) {
   const frame = JSON.parse(line);
   if (frame.type === "control_request" && frame.request?.subtype === "initialize") {
@@ -183,21 +192,37 @@ for await (const line of input) {
         }
       }
     }));
+    continue;
   }
-  if (frame.shouldQuery === false) console.log(JSON.stringify({type: "result", num_turns: 0}));
+  if (frame.shouldQuery === false) {
+    console.log(JSON.stringify({type: "result", num_turns: 0}));
+    continue;
+  }
+  if (frame.type !== "user") continue;
+  queryCount += 1;
+  const requestedTool = frame.message?.content?.some?.(block => block.type === "text" && block.text === "call-tool");
+  const text = queryCount === 1 ? "ok" : \`ok\${queryCount}\`;
+  const id = queryCount === 1 ? "m_fake" : \`m_fake_\${queryCount}\`;
+  const usage = {input_tokens: 3, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0};
+  if (requestedTool) {
+    const content = [{type: "tool_use", id: "tool_fake", name: "mcp__pi__echo", input: {value: "test"}}];
+    console.log(JSON.stringify({type: "stream_event", event: {type: "message_stop"}}));
+    console.log(JSON.stringify({type: "assistant", message: {id, role: "assistant", content, stop_reason: "tool_use", usage}}));
+    console.log(JSON.stringify({type: "result", subtype: "error_max_turns", is_error: true, usage}));
+    continue;
+  }
+  const events = [
+    {type: "message_start", message: {id, role: "assistant", content: [], usage}},
+    {type: "content_block_start", index: 0, content_block: {type: "text", text: ""}},
+    {type: "content_block_delta", index: 0, delta: {type: "text_delta", text}},
+    {type: "content_block_stop", index: 0},
+    {type: "message_delta", delta: {stop_reason: "end_turn"}, usage},
+    {type: "message_stop"}
+  ];
+  for (const event of events) console.log(JSON.stringify({type: "stream_event", event}));
+  console.log(JSON.stringify({type: "assistant", message: {id, role: "assistant", content: [{type: "text", text}], stop_reason: "end_turn", usage}}));
+  console.log(JSON.stringify({type: "result", subtype: "success", is_error: false, usage}));
 }
-const usage = {input_tokens: 3, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0};
-const events = [
-  {type: "message_start", message: {id: "m_fake", role: "assistant", content: [], usage}},
-  {type: "content_block_start", index: 0, content_block: {type: "text", text: ""}},
-  {type: "content_block_delta", index: 0, delta: {type: "text_delta", text: "ok"}},
-  {type: "content_block_stop", index: 0},
-  {type: "message_delta", delta: {stop_reason: "end_turn"}, usage},
-  {type: "message_stop"}
-];
-for (const event of events) console.log(JSON.stringify({type: "stream_event", event}));
-console.log(JSON.stringify({type: "assistant", message: {id: "m_fake", role: "assistant", content: [{type: "text", text: "ok"}], stop_reason: "end_turn", usage}}));
-console.log(JSON.stringify({type: "result", subtype: "success", is_error: false, usage}));
 `,
     "utf8",
   );
@@ -280,9 +305,122 @@ console.log(JSON.stringify({type: "result", subtype: "success", is_error: false,
     assert.equal(result.message.id, "m_fake");
     assert.equal(result.message.stop_reason, "end_turn");
     assert.equal(result.usage.input_tokens, 3);
-    assert.equal(result.admission.upstreamRequests, 0);
+    assert.equal(result.relay.upstreamRequests, 0);
     assert.equal(events.at(-1), "message_stop");
+
+    const processLog = join(root, "processes.log");
+    const common = {
+      model: "sonnet",
+      cwd: workingRoot,
+      systemPrompt: "system",
+      manifest: [],
+      extraBody: { tools: [] },
+      toolNames: new Set<string>(),
+      env: {
+        PI_CLAUDE_CODE_COMMAND: executable,
+        EXPECTED_CWD: workingRoot,
+        EXPECTED_SYSTEM_PROMPT: "system",
+        PROCESS_LOG: processLog,
+      },
+      timeoutMs: 5_000,
+    };
+    const first = await runClaudeRequest({
+      ...common,
+      sessionId: "stable-session",
+      frames: [{ type: "user", message: { role: "user", content: [{ type: "text", text: "one" }] } }],
+    });
+    const second = await runClaudeRequest({
+      ...common,
+      sessionId: "stable-session",
+      frames: [
+        {
+          type: "user",
+          message: { role: "user", content: [{ type: "text", text: "one" }] },
+          shouldQuery: false,
+        },
+        { type: "assistant", message: { role: "assistant", content: first.message.content } },
+        { type: "user", message: { role: "user", content: [{ type: "text", text: "two" }] } },
+      ],
+    });
+    assert.equal(second.message.id, "m_fake_2");
+    assert.equal((await readFile(processLog, "utf8")).trim().split("\n").length, 1);
+    assert.equal(cachedClaudeProcessCount(), 1);
+
+    // A branch mismatch replaces the warm process instead of risking stale
+    // hidden Claude state.
+    const branched = await runClaudeRequest({
+      ...common,
+      sessionId: "stable-session",
+      frames: [{ type: "user", message: { role: "user", content: [{ type: "text", text: "branch" }] } }],
+    });
+    assert.equal(branched.message.id, "m_fake");
+    assert.equal((await readFile(processLog, "utf8")).trim().split("\n").length, 2);
+
+    // Retained workers are deliberately bounded. Creating two more sessions
+    // evicts the least-recently-used idle worker and leaves only two alive.
+    for (const sessionId of ["second-session", "third-session"]) {
+      await runClaudeRequest({
+        ...common,
+        sessionId,
+        frames: [{ type: "user", message: { role: "user", content: [{ type: "text", text: sessionId }] } }],
+      });
+    }
+    assert.equal(cachedClaudeProcessCount(), 2);
+    assert.equal((await readFile(processLog, "utf8")).trim().split("\n").length, 4);
+
+    // A tool call makes Claude's hidden history diverge because its inert MCP
+    // server has already returned a denial. Never retain that process; replay
+    // the real Pi tool result in a fresh process on the next request.
+    const toolCommon = {
+      ...common,
+      manifest: [
+        {
+          name: "echo",
+          description: "Echo a value",
+          inputSchema: { type: "object", properties: { value: { type: "string" } } },
+        },
+      ],
+      extraBody: {
+        tools: [
+          {
+            name: "mcp__pi__echo",
+            description: "Echo a value",
+            input_schema: { type: "object", properties: { value: { type: "string" } } },
+          },
+        ],
+      },
+      toolNames: new Set(["echo"]),
+    };
+    const toolCall = await runClaudeRequest({
+      ...toolCommon,
+      sessionId: "tool-session",
+      frames: [{ type: "user", message: { role: "user", content: [{ type: "text", text: "call-tool" }] } }],
+    });
+    assert.equal(toolCall.message.stop_reason, "tool_use");
+    assert.equal(cachedClaudeProcessCount(), 1);
+    const afterTool = await runClaudeRequest({
+      ...toolCommon,
+      sessionId: "tool-session",
+      frames: [
+        {
+          type: "user",
+          message: { role: "user", content: [{ type: "text", text: "call-tool" }] },
+          shouldQuery: false,
+        },
+        { type: "assistant", message: { role: "assistant", content: toolCall.message.content } },
+        {
+          type: "user",
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "tool_fake", content: "echoed" }],
+          },
+        },
+      ],
+    });
+    assert.equal(afterTool.message.id, "m_fake");
+    assert.equal((await readFile(processLog, "utf8")).trim().split("\n").length, 6);
   } finally {
+    await closeClaudeProcesses();
     await rm(root, { recursive: true, force: true });
   }
 });

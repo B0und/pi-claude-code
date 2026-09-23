@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import * as http from "node:http";
 import test from "node:test";
-import { Admission } from "../src/admission.ts";
+import { TurnRelay } from "../src/turn-relay.ts";
 
 function listen(server: http.Server): Promise<number> {
   return new Promise((resolve) => {
@@ -13,7 +13,7 @@ function listen(server: http.Server): Promise<number> {
   });
 }
 
-test("admits one upstream Messages request and captures its SSE response", async () => {
+test("relays one upstream Messages request and captures its SSE response", async () => {
   const upstreamBodies: string[] = [];
   const upstreamBetas: string[] = [];
   const upstream = http.createServer(async (request, response) => {
@@ -40,7 +40,7 @@ test("admits one upstream Messages request and captures its SSE response", async
   });
   const upstreamPort = await listen(upstream);
   const observed: string[] = [];
-  const admission = new Admission(
+  const relay = new TurnRelay(
     `http://127.0.0.1:${upstreamPort}`,
     5_000,
     (event) => observed.push(event.type),
@@ -49,7 +49,7 @@ test("admits one upstream Messages request and captures its SSE response", async
   );
 
   try {
-    const baseUrl = await admission.start();
+    const baseUrl = await relay.start();
     const first = await fetch(`${baseUrl}/v1/messages`, {
       method: "POST",
       headers: { "anthropic-beta": "existing-test" },
@@ -59,21 +59,34 @@ test("admits one upstream Messages request and captures its SSE response", async
     await first.text();
     const second = await fetch(`${baseUrl}/v1/messages`, { method: "POST", body: "{}" });
     assert.equal(second.status, 400);
-    await admission.settled();
+    await relay.settled();
 
     assert.equal(upstreamBodies.length, 1);
     assert.deepEqual(JSON.parse(upstreamBodies[0]!), { rewritten: true });
-    assert.deepEqual(JSON.parse(admission.originalRequestBody!.toString("utf8")), {});
+    assert.deepEqual(JSON.parse(relay.originalRequestBody!.toString("utf8")), {});
     assert.equal(upstreamBetas[0], "existing-test,native-tools-test");
-    assert.equal(admission.used, true);
-    assert.equal(admission.denied, 1);
-    assert.equal(admission.capture.complete, true);
-    assert.equal(admission.capture.message?.content[0]?.type, "text");
-    assert.equal((admission.capture.message?.content[0] as { text: string }).text, "hello");
-    assert.equal(admission.requestId, "req_test");
+    assert.equal(relay.used, true);
+    assert.equal(relay.denied, 1);
+    assert.equal(relay.capture.complete, true);
+    assert.equal(relay.capture.message?.content[0]?.type, "text");
+    assert.equal((relay.capture.message?.content[0] as { text: string }).text, "hello");
+    assert.equal(relay.requestId, "req_test");
     assert.deepEqual(observed.at(-1), "message_stop");
+
+    relay.finishTurn();
+    const nextObserved: string[] = [];
+    relay.beginTurn((event) => nextObserved.push(event.type));
+    const next = await fetch(`${baseUrl}/v1/messages`, { method: "POST", body: '{"turn":2}' });
+    assert.equal(next.status, 200);
+    await next.text();
+    await relay.settled();
+    assert.equal(upstreamBodies.length, 2);
+    assert.deepEqual(JSON.parse(upstreamBodies[1]!), { turn: 2 });
+    assert.equal(relay.denied, 0);
+    assert.equal(relay.capture.complete, true);
+    assert.equal(nextObserved.at(-1), "message_stop");
   } finally {
-    await admission.close();
+    await relay.close();
     await new Promise<void>((resolve) => upstream.close(() => resolve()));
   }
 });

@@ -104,8 +104,8 @@ const STRIPPED_REQUEST_HEADERS = new Set([
 
 const STRIPPED_RESPONSE_HEADERS = new Set(["connection", "transfer-encoding", "server", "date"]);
 
-export class Admission {
-  readonly capture: AnthropicCapture;
+export class TurnRelay {
+  capture: AnthropicCapture;
   used = false;
   denied = 0;
   status?: number;
@@ -116,19 +116,22 @@ export class Admission {
   requestBody?: Buffer;
 
   private readonly upstream: URL;
-  private readonly prefix = `/admit/${randomBytes(32).toString("base64url")}`;
+  private readonly prefix = `/turn/${randomBytes(32).toString("base64url")}`;
   private readonly server: http.Server;
   private readonly sockets = new Set<Destroyable>();
   private readonly active = new Set<Promise<void>>();
   private cancelled = false;
+  private closed = false;
   private baseUrl?: string;
+  private transformRequest?: (body: Buffer) => Buffer;
+  private requestBetas: string[] = [];
 
   constructor(
     upstream = "https://api.anthropic.com",
     private readonly timeoutMs = 180_000,
     onEvent?: (event: AnthropicStreamEvent) => void,
-    private readonly transformRequest?: (body: Buffer) => Buffer,
-    private readonly requestBetas: string[] = [],
+    transformRequest?: (body: Buffer) => Buffer,
+    requestBetas: string[] = [],
   ) {
     this.upstream = new URL(upstream);
     const loopback = ["127.0.0.1", "::1", "localhost"].includes(this.upstream.hostname);
@@ -142,10 +145,43 @@ export class Admission {
       throw new Error("Claude Code upstream must be HTTPS or a loopback HTTP fixture");
     }
     this.capture = new AnthropicCapture(onEvent);
+    this.transformRequest = transformRequest;
+    this.requestBetas = requestBetas;
     this.server = http.createServer((request, response) => {
       const operation = this.handle(request, response).finally(() => this.active.delete(operation));
       this.active.add(operation);
     });
+  }
+
+  /** Arm the persistent relay for one new Claude turn. */
+  beginTurn(
+    onEvent?: (event: AnthropicStreamEvent) => void,
+    transformRequest?: (body: Buffer) => Buffer,
+    requestBetas: string[] = [],
+  ): void {
+    if (this.closed) throw new Error("Claude Code turn relay is closed");
+    if (this.active.size > 0) throw new Error("Claude Code turn relay still has an active request");
+    this.capture = new AnthropicCapture(onEvent);
+    this.used = false;
+    this.denied = 0;
+    this.status = undefined;
+    this.requestId = undefined;
+    this.failure = undefined;
+    this.errorBody = Buffer.alloc(0);
+    this.originalRequestBody = undefined;
+    this.requestBody = undefined;
+    this.transformRequest = transformRequest;
+    this.requestBetas = requestBetas;
+    this.cancelled = false;
+  }
+
+  /** Disarm the current turn without closing the worker-scoped HTTP server. */
+  finishTurn(): void {
+    if (this.cancelled) return;
+    this.cancelled = true;
+    for (const socket of this.sockets) socket.destroy(new Error("Claude Code request aborted"));
+    this.sockets.clear();
+    this.server.closeAllConnections?.();
   }
 
   async start(): Promise<string> {
@@ -173,11 +209,7 @@ export class Admission {
   }
 
   abort(): void {
-    if (this.cancelled) return;
-    this.cancelled = true;
-    for (const socket of this.sockets) socket.destroy(new Error("Claude Code request aborted"));
-    this.sockets.clear();
-    this.server.closeAllConnections?.();
+    this.finishTurn();
   }
 
   async settled(): Promise<void> {
@@ -185,6 +217,7 @@ export class Admission {
   }
 
   async close(): Promise<void> {
+    this.closed = true;
     this.abort();
     await new Promise<void>((resolve) => {
       if (!this.server.listening) return resolve();
@@ -205,7 +238,7 @@ export class Admission {
       const body = Buffer.from(
         JSON.stringify({
           type: "error",
-          error: { type: "invalid_request_error", message: "PI_CLAUDE_CODE_ADMISSION_CONSUMED" },
+          error: { type: "invalid_request_error", message: "PI_CLAUDE_CODE_TURN_RELAY_CONSUMED" },
         }),
       );
       response.writeHead(400, { "content-type": "application/json", "content-length": body.length }).end(body);
@@ -306,7 +339,7 @@ export class Admission {
       };
       const onClose = () => {
         cleanup();
-        reject(new Error("Claude Code disconnected from the admission relay"));
+        reject(new Error("Claude Code disconnected from the turn relay"));
       };
       const onError = (error: Error) => {
         cleanup();

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -5,8 +6,8 @@ import { delimiter, dirname, extname, isAbsolute, join, resolve } from "node:pat
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { spawn, type ChildProcess } from "node:child_process";
-import type { ProviderAuthInteraction } from "@earendil-works/pi-ai";
-import { Admission } from "./admission.ts";
+import { registerSessionResourceCleanup, type ProviderAuthInteraction } from "@earendil-works/pi-ai";
+import { TurnRelay } from "./turn-relay.ts";
 import type { DiscoveredClaudeModel } from "./model-catalog.ts";
 import type {
   AnthropicStreamEvent,
@@ -53,9 +54,11 @@ export interface RunClaudeInput {
   initialSystemMessages?: unknown[];
   /** Pi system/tool deltas to restore at their historical assistant boundaries. */
   nativeSystemInjections?: NativeSystemInjection[];
-  /** Beta features appended to Claude Code's own request header by the admission relay. */
+  /** Beta features appended to Claude Code's own request header by the turn relay. */
   betas?: string[];
   onEvent?: (event: AnthropicStreamEvent) => void;
+  /** Pi session whose linear continuation may reuse a warm Claude process. */
+  sessionId?: string;
 }
 
 export interface RunClaudeOutput {
@@ -63,7 +66,7 @@ export interface RunClaudeOutput {
   result: NativeResult;
   usage: NativeUsage;
   exitCode: number;
-  admission: {
+  relay: {
     upstreamRequests: number;
     blockedRequests: number;
     requestId?: string;
@@ -751,30 +754,241 @@ export function rewriteInitialRequest(
   return Buffer.from(JSON.stringify(payload));
 }
 
-export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaudeOutput> {
+const CLAUDE_PROCESS_IDLE_TTL_MS = 5 * 60 * 1_000;
+const CLAUDE_PROCESS_MAX_AGE_MS = 5 * 60 * 1_000;
+const MAX_CACHED_CLAUDE_PROCESSES = 2;
+
+interface ClaudeLaunchPlan {
+  env: Record<string, string>;
+  fingerprint: string;
+  timeoutMs: number;
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .filter(([, child]) => child !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
+    .join(",")}}`;
+}
+
+function digest(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+function frameHistoryHash(frames: NativeFrame[]): string {
+  return digest(
+    frames.map((frame) => ({
+      type: frame.type,
+      message: frame.message,
+    })),
+  );
+}
+
+function launchPlan(input: RunClaudeInput): ClaudeLaunchPlan {
   const timeoutMs = input.timeoutMs ?? 180_000;
-  input.signal?.throwIfAborted();
-  const effectiveInputEnv = { ...process.env, ...input.env };
-  const status = await getClaudeStatus(effectiveInputEnv, input.signal);
-  if (!status.available || !status.command) throw new Error(INSTALL_HINT);
-  if (!status.loggedIn) throw new Error(LOGIN_HINT);
-
   const env = processEnvironment(input.env, input.extraBody);
-  const root = await mkdtemp(join(tmpdir(), "pi-claude-code-"));
-  const toolsPath = join(root, "tools.json");
-  const settingsPath = join(root, "settings.json");
-  const systemPath = join(root, "system.md");
-  const inertMcpPath = fileURLToPath(new URL("./inert-mcp.mjs", import.meta.url));
-  let child: ChildProcess | undefined;
-  let admission: Admission | undefined;
-  let stderr = "";
+  return {
+    env,
+    timeoutMs,
+    fingerprint: digest({
+      command: configuredCommand(env),
+      cwd: resolve(input.cwd ?? process.cwd()),
+      env,
+      extraBody: input.extraBody,
+      manifest: input.manifest,
+      model: input.model,
+      systemPrompt: input.systemPrompt,
+      timeoutMs,
+      upstreamUrl: input.upstreamUrl ?? "https://api.anthropic.com",
+    }),
+  };
+}
 
-  try {
-    await Promise.all([
-      writeFile(toolsPath, JSON.stringify(input.manifest), "utf8"),
-      writeFile(settingsPath, JSON.stringify({ env: { CLAUDE_CODE_EXTRA_BODY: JSON.stringify(input.extraBody) } }), "utf8"),
-      writeFile(systemPath, input.systemPrompt, "utf8"),
+class ClaudeProcess {
+  busy = false;
+  readonly createdAt = Date.now();
+  lastUsed = this.createdAt;
+
+  private tipHash?: string;
+  private idleTimer?: NodeJS.Timeout;
+  private closed = false;
+
+  private constructor(
+    readonly fingerprint: string,
+    private readonly root: string,
+    private readonly child: ChildProcess,
+    private readonly relay: TurnRelay,
+    private readonly queue: AsyncQueue<NativeOutputEvent>,
+    private readonly readTask: Promise<void>,
+    private readonly exitOutcome: Promise<{ code?: number; error?: Error }>,
+    private readonly timeoutMs: number,
+    private stderr: string,
+  ) {}
+
+  static async create(input: RunClaudeInput, plan: ClaudeLaunchPlan): Promise<ClaudeProcess> {
+    input.signal?.throwIfAborted();
+    const effectiveInputEnv = { ...process.env, ...input.env };
+    const status = await getClaudeStatus(effectiveInputEnv, input.signal);
+    if (!status.available || !status.command) throw new Error(INSTALL_HINT);
+    if (!status.loggedIn) throw new Error(LOGIN_HINT);
+
+    const root = await mkdtemp(join(tmpdir(), "pi-claude-code-"));
+    const toolsPath = join(root, "tools.json");
+    const settingsPath = join(root, "settings.json");
+    const systemPath = join(root, "system.md");
+    const inertMcpPath = fileURLToPath(new URL("./inert-mcp.mjs", import.meta.url));
+    let child: ChildProcess | undefined;
+    let relay: TurnRelay | undefined;
+
+    try {
+      await Promise.all([
+        writeFile(toolsPath, JSON.stringify(input.manifest), "utf8"),
+        writeFile(settingsPath, JSON.stringify({ env: { CLAUDE_CODE_EXTRA_BODY: JSON.stringify(input.extraBody) } }), "utf8"),
+        writeFile(systemPath, input.systemPrompt, "utf8"),
+      ]);
+
+      relay = new TurnRelay(input.upstreamUrl ?? "https://api.anthropic.com", plan.timeoutMs);
+      const env = { ...plan.env, ANTHROPIC_BASE_URL: await relay.start() };
+      const mcp = {
+        mcpServers: {
+          pi: { command: process.execPath, args: [inertMcpPath, toolsPath] },
+        },
+      };
+      const args = [
+        "-p",
+        "--model",
+        input.model,
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--tools",
+        "",
+        "--system-prompt-file",
+        systemPath,
+        "--settings",
+        settingsPath,
+        "--setting-sources",
+        "",
+        "--strict-mcp-config",
+        "--disable-slash-commands",
+        "--max-turns",
+        "1",
+        "--permission-mode",
+        "dontAsk",
+        "--no-session-persistence",
+        "--mcp-config",
+        JSON.stringify(mcp),
+      ];
+
+      child = spawnCommand(status.command, args, {
+        // Claude Code tells the model its process cwd. Keep transport files
+        // private while exposing Pi's real working directory to the model.
+        cwd: input.cwd ?? process.cwd(),
+        env,
+        detached: process.platform !== "win32",
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stderr = "";
+      child.stderr?.setEncoding("utf8");
+      child.stderr?.on("data", (chunk: string) => (stderr = (stderr + chunk).slice(-65_536)));
+
+      const queue = new AsyncQueue<NativeOutputEvent>();
+      const reader = createInterface({ input: child.stdout!, crlfDelay: Infinity });
+      const readTask = (async () => {
+        try {
+          for await (const line of reader) {
+            if (!line.trim()) continue;
+            try {
+              queue.push(JSON.parse(line) as NativeOutputEvent);
+            } catch (error) {
+              throw new Error(`Invalid Claude Code stream-json output: ${line.slice(0, 300)}`, { cause: error });
+            }
+          }
+          queue.end();
+        } catch (error) {
+          queue.end(error instanceof Error ? error : new Error(String(error)));
+        }
+      })();
+      const exitOutcome = childExit(child).then(
+        (code) => ({ code }),
+        (error: unknown) => ({ error: error instanceof Error ? error : new Error(String(error)) }),
+      );
+      const worker = new ClaudeProcess(
+        plan.fingerprint,
+        root,
+        child,
+        relay,
+        queue,
+        readTask,
+        exitOutcome,
+        plan.timeoutMs,
+        stderr,
+      );
+      // Keep reading the closure rather than the constructor's initial string.
+      child.stderr?.on("data", (chunk: string) => (worker.stderr = (worker.stderr + chunk).slice(-65_536)));
+      return worker;
+    } catch (error) {
+      relay?.abort();
+      if (child && child.exitCode === null) killProcessTree(child);
+      await relay?.close();
+      await rm(root, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  isAlive(): boolean {
+    return !this.closed && this.child.exitCode === null && !!this.child.stdin?.writable;
+  }
+
+  isExpired(now = Date.now()): boolean {
+    return now - this.createdAt >= CLAUDE_PROCESS_MAX_AGE_MS || now - this.lastUsed >= CLAUDE_PROCESS_IDLE_TTL_MS;
+  }
+
+  canContinue(input: RunClaudeInput): boolean {
+    if (!this.tipHash || input.frames.length === 0) return false;
+    return frameHistoryHash(input.frames.slice(0, -1)) === this.tipHash;
+  }
+
+  clearIdleTimer(): void {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
+  }
+
+  armIdleTimer(expire: () => void): void {
+    this.clearIdleTimer();
+    this.lastUsed = Date.now();
+    const remainingLifetime = CLAUDE_PROCESS_MAX_AGE_MS - (this.lastUsed - this.createdAt);
+    this.idleTimer = setTimeout(expire, Math.max(0, Math.min(CLAUDE_PROCESS_IDLE_TTL_MS, remainingLifetime)));
+    this.idleTimer.unref?.();
+  }
+
+  commit(input: RunClaudeInput, message: NativeMessage): boolean {
+    // Claude Code executes MCP calls internally before emitting its max-turns
+    // result. Our inert MCP response is therefore part of its hidden history,
+    // while Pi will append the real tool result. That state is not a faithful
+    // continuation and must be discarded; the next request replays from Pi.
+    if (message.content.some((block) => block.type === "tool_use")) {
+      this.tipHash = undefined;
+      return false;
+    }
+    this.tipHash = frameHistoryHash([
+      ...input.frames,
+      { type: "assistant", message: { role: "assistant", content: message.content } },
     ]);
+    return true;
+  }
+
+  async run(input: RunClaudeInput, continuation: boolean): Promise<RunClaudeOutput> {
+    if (!this.isAlive()) throw new Error("Claude Code process is no longer available");
+    input.signal?.throwIfAborted();
 
     let sawMessageStop = false;
     const deliver = (event: AnthropicStreamEvent) => {
@@ -782,9 +996,7 @@ export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaude
       input.onEvent?.(event);
     };
     const canonicalInitialUser = input.frames.find((frame) => frame.type === "user")?.message.content ?? [];
-    admission = new Admission(
-      input.upstreamUrl ?? "https://api.anthropic.com",
-      timeoutMs,
+    this.relay.beginTurn(
       deliver,
       input.initialUserPrefix || input.initialSystemMessages || input.nativeSystemInjections
         ? (body) =>
@@ -798,90 +1010,24 @@ export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaude
         : undefined,
       input.betas,
     );
-    env.ANTHROPIC_BASE_URL = await admission.start();
 
-    const mcp = {
-      mcpServers: {
-        pi: { command: process.execPath, args: [inertMcpPath, toolsPath] },
-      },
-    };
-    const args = [
-      "-p",
-      "--model",
-      input.model,
-      "--input-format",
-      "stream-json",
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--include-partial-messages",
-      "--tools",
-      "",
-      "--system-prompt-file",
-      systemPath,
-      "--settings",
-      settingsPath,
-      "--setting-sources",
-      "",
-      "--strict-mcp-config",
-      "--disable-slash-commands",
-      "--max-turns",
-      "1",
-      "--permission-mode",
-      "dontAsk",
-      "--no-session-persistence",
-      "--mcp-config",
-      JSON.stringify(mcp),
-    ];
-
-    child = spawnCommand(status.command, args, {
-      // Claude Code tells the model its process cwd. Running in the transport
-      // directory makes it ask Pi's tools to inspect an already-deleted temp
-      // path. Keep only transport files private; expose Pi's real cwd here.
-      cwd: input.cwd ?? process.cwd(),
-      env,
-      detached: process.platform !== "win32",
-      windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    child.stderr?.setEncoding("utf8");
-    child.stderr?.on("data", (chunk: string) => (stderr = (stderr + chunk).slice(-65_536)));
-
-    const queue = new AsyncQueue<NativeOutputEvent>();
-    const reader = createInterface({ input: child.stdout!, crlfDelay: Infinity });
-    const readTask = (async () => {
-      try {
-        for await (const line of reader) {
-          if (!line.trim()) continue;
-          try {
-            queue.push(JSON.parse(line) as NativeOutputEvent);
-          } catch (error) {
-            throw new Error(`Invalid Claude Code stream-json output: ${line.slice(0, 300)}`, { cause: error });
-          }
-        }
-        queue.end();
-      } catch (error) {
-        queue.end(error instanceof Error ? error : new Error(String(error)));
-      }
-    })();
-    const exitPromise = childExit(child);
     const abort = () => {
-      admission?.abort();
-      if (child) killProcessTree(child);
+      this.relay.abort();
+      this.closeNow();
     };
     input.signal?.addEventListener("abort", abort, { once: true });
-
     const assistants: NativeMessage[] = [];
-    const results: NativeResult[] = [];
+    let result: NativeResult | undefined;
     let nativeError: string | undefined;
 
     try {
-      for (const frame of input.frames) {
-        await writeFrame(child, frame);
+      const frames = continuation ? input.frames.slice(-1) : input.frames;
+      for (const frame of frames) {
+        await writeFrame(this.child, frame);
         if (frame.shouldQuery === false) {
           for (;;) {
-            const event = await queue.next(input.signal, timeoutMs);
-            if (!event) throw new Error("Claude Code exited before acknowledging history replay");
+            const event = await this.queue.next(input.signal, this.timeoutMs);
+            if (!event) throw await this.exitError("Claude Code exited before acknowledging history replay");
             if (event.type === "result") {
               if (event.num_turns !== 0 || event.is_error) {
                 throw new Error("Claude Code rejected zero-turn history replay");
@@ -891,55 +1037,52 @@ export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaude
           }
         }
       }
-      child.stdin?.end();
 
       for (;;) {
-        const event = await queue.next(input.signal, timeoutMs);
-        if (!event) break;
+        const event = await this.queue.next(input.signal, this.timeoutMs);
+        if (!event) throw await this.exitError("Claude Code exited before completing its response");
         if (event.type === "assistant") {
           const error = nativeErrorText(event);
           if (error !== undefined) nativeError = error;
           else assistants.push(event.message);
         } else if (event.type === "result") {
-          results.push(event);
-        } else if (event.type === "stream_event" && !admission.used) {
+          result = event;
+          break;
+        } else if (event.type === "stream_event" && !this.relay.used) {
           deliver(event.event);
         }
       }
-      await readTask;
-      const exitCode = await exitPromise;
-      await admission.settled();
+      await this.relay.settled();
       input.signal?.throwIfAborted();
 
       let message: NativeMessage | undefined;
-      if (admission.used) {
-        if (admission.status !== 200 || !admission.capture.complete || !admission.capture.message) {
-          let detail = `status ${admission.status ?? "unknown"}, capture ${admission.capture.complete ? "complete" : "incomplete"}`;
-          if (admission.failure) detail += `, relay failure ${admission.failure}`;
-          if (admission.denied) detail += `, native retries denied ${admission.denied}`;
-          const upstreamError = admission.errorText();
+      if (this.relay.used) {
+        if (this.relay.status !== 200 || !this.relay.capture.complete || !this.relay.capture.message) {
+          let detail = `status ${this.relay.status ?? "unknown"}, capture ${this.relay.capture.complete ? "complete" : "incomplete"}`;
+          if (this.relay.failure) detail += `, relay failure ${this.relay.failure}`;
+          if (this.relay.denied) detail += `, native retries denied ${this.relay.denied}`;
+          const upstreamError = this.relay.errorText();
           if (upstreamError) detail += `, upstream said: ${upstreamError.slice(0, 500)}`;
           throw new Error(`Incomplete Claude Code upstream response (${detail})`);
         }
-        message = admission.capture.message;
+        message = this.relay.capture.message;
         sawMessageStop = true;
       } else {
         message = assistants.at(-1);
       }
 
-      const result = results.at(-1);
-      if (results.length !== 1 || !message || !sawMessageStop || !result) {
+      if (!message || !sawMessageStop || !result) {
         throw new Error(
-          `Incomplete Claude Code response: assistant, message_stop and one result required${stderr ? ` (${stderr.trim().slice(-500)})` : ""}`,
+          `Incomplete Claude Code response: assistant, message_stop and one result required${this.stderr ? ` (${this.stderr.trim().slice(-500)})` : ""}`,
         );
       }
 
-      const nativeFailureHandled = admission.denied > 0 || message.stop_reason === "refusal";
+      const nativeFailureHandled = this.relay.denied > 0 || message.stop_reason === "refusal";
       if (nativeError && !nativeFailureHandled) throw new Error(`Claude Code API error: ${nativeError}`);
       const hasTools = message.content.some((block) => block.type === "tool_use");
-      const maxTurnsBoundary = hasTools && result.subtype === "error_max_turns" && exitCode === 1;
-      if (!maxTurnsBoundary && !nativeFailureHandled && (exitCode !== 0 || result.is_error || result.subtype !== "success")) {
-        throw new Error(`Claude Code request failed: ${result.subtype ?? `exit ${exitCode}`}`);
+      const maxTurnsBoundary = hasTools && result.subtype === "error_max_turns";
+      if (!maxTurnsBoundary && !nativeFailureHandled && (result.is_error || result.subtype !== "success")) {
+        throw new Error(`Claude Code request failed: ${result.subtype ?? "unknown result"}`);
       }
 
       for (const block of message.content) {
@@ -958,24 +1101,180 @@ export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaude
         message,
         result,
         usage,
-        exitCode,
-        admission: {
-          upstreamRequests: Number(admission.used),
-          blockedRequests: admission.denied,
-          requestId: admission.requestId,
+        exitCode: this.child.exitCode ?? 0,
+        relay: {
+          upstreamRequests: Number(this.relay.used),
+          blockedRequests: this.relay.denied,
+          requestId: this.relay.requestId,
         },
         initialUserPrefix:
-          input.initialUserPrefix ?? deriveInitialUserPrefix(admission.originalRequestBody, canonicalInitialUser),
+          input.initialUserPrefix ?? deriveInitialUserPrefix(this.relay.originalRequestBody, canonicalInitialUser),
         initialSystemMessages:
-          input.initialSystemMessages ?? deriveInitialSystemMessages(admission.originalRequestBody),
+          input.initialSystemMessages ?? deriveInitialSystemMessages(this.relay.originalRequestBody),
       };
     } finally {
       input.signal?.removeEventListener("abort", abort);
+      this.relay.finishTurn();
     }
+  }
+
+  async close(): Promise<void> {
+    this.closeNow();
+    await Promise.allSettled([this.readTask, this.exitOutcome, this.relay.close()]);
+    await rm(this.root, { recursive: true, force: true });
+  }
+
+  private closeNow(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.clearIdleTimer();
+    this.relay.abort();
+    if (this.child.exitCode === null) killProcessTree(this.child);
+  }
+
+  private async exitError(fallback: string): Promise<Error> {
+    const outcome = await this.exitOutcome;
+    if (outcome.error) return outcome.error;
+    const detail = this.stderr.trim().slice(-500);
+    return new Error(`${fallback} (exit ${outcome.code ?? "unknown"}${detail ? `: ${detail}` : ""})`);
+  }
+}
+
+interface AcquiredProcess {
+  worker: ClaudeProcess;
+  retained: boolean;
+  continuation: boolean;
+  sessionId?: string;
+}
+
+const processCache = new Map<string, ClaudeProcess>();
+let managerTail: Promise<void> = Promise.resolve();
+
+async function withManagerLock<T>(operation: () => Promise<T> | T): Promise<T> {
+  const previous = managerTail;
+  let release!: () => void;
+  managerTail = new Promise<void>((resolve) => (release = resolve));
+  await previous;
+  try {
+    return await operation();
   } finally {
-    admission?.abort();
-    if (child && child.exitCode === null) killProcessTree(child);
-    await admission?.close();
-    await rm(root, { recursive: true, force: true });
+    release();
+  }
+}
+
+async function expireIdleProcess(sessionId: string, worker: ClaudeProcess): Promise<void> {
+  const expired = await withManagerLock(() => {
+    if (
+      processCache.get(sessionId) !== worker ||
+      worker.busy ||
+      !worker.isExpired()
+    ) {
+      return false;
+    }
+    processCache.delete(sessionId);
+    return true;
+  });
+  if (expired) await worker.close();
+}
+
+async function acquireProcess(input: RunClaudeInput, plan: ClaudeLaunchPlan): Promise<AcquiredProcess> {
+  return withManagerLock(async () => {
+    const sessionId = input.sessionId;
+    const cached = sessionId ? processCache.get(sessionId) : undefined;
+    if (cached && !cached.busy) {
+      cached.clearIdleTimer();
+      if (
+        cached.isAlive() &&
+        !cached.isExpired() &&
+        cached.fingerprint === plan.fingerprint &&
+        cached.canContinue(input)
+      ) {
+        cached.busy = true;
+        return { worker: cached, retained: true, continuation: true, sessionId };
+      }
+      processCache.delete(sessionId!);
+      await cached.close();
+    }
+
+    // A concurrent request must not mutate the cached conversation. It gets a
+    // one-shot process, as does a request without Pi's stable session ID.
+    const retain = !!sessionId && !cached?.busy;
+    if (retain) {
+      while (processCache.size >= MAX_CACHED_CLAUDE_PROCESSES) {
+        const victim = [...processCache.entries()]
+          .filter(([, worker]) => !worker.busy)
+          .sort((left, right) => left[1].lastUsed - right[1].lastUsed)[0];
+        if (!victim) break;
+        processCache.delete(victim[0]);
+        await victim[1].close();
+      }
+    }
+
+    const worker = await ClaudeProcess.create(input, plan);
+    worker.busy = true;
+    const retained = retain && processCache.size < MAX_CACHED_CLAUDE_PROCESSES;
+    if (retained) processCache.set(sessionId!, worker);
+    return { worker, retained, continuation: false, sessionId };
+  });
+}
+
+/** Close warm Claude processes for one Pi session, or all sessions. */
+export async function closeClaudeProcesses(sessionId?: string): Promise<void> {
+  const workers = await withManagerLock(() => {
+    if (sessionId) {
+      const worker = processCache.get(sessionId);
+      processCache.delete(sessionId);
+      return worker ? [worker] : [];
+    }
+    const all = [...processCache.values()];
+    processCache.clear();
+    return all;
+  });
+  await Promise.allSettled(workers.map((worker) => worker.close()));
+}
+
+/** Test/debug visibility without exposing child processes themselves. */
+export function cachedClaudeProcessCount(): number {
+  return processCache.size;
+}
+
+registerSessionResourceCleanup((sessionId) => {
+  void closeClaudeProcesses(sessionId);
+});
+
+export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaudeOutput> {
+  input.signal?.throwIfAborted();
+  const plan = launchPlan(input);
+  const acquired = await acquireProcess(input, plan);
+  try {
+    const output = await acquired.worker.run(input, acquired.continuation);
+    const stable = acquired.worker.commit(input, output.message);
+    if (
+      stable &&
+      acquired.retained &&
+      acquired.sessionId &&
+      processCache.get(acquired.sessionId) === acquired.worker
+    ) {
+      acquired.worker.busy = false;
+      acquired.worker.armIdleTimer(() => {
+        void expireIdleProcess(acquired.sessionId!, acquired.worker);
+      });
+    } else {
+      if (acquired.sessionId && processCache.get(acquired.sessionId) === acquired.worker) {
+        await withManagerLock(() => {
+          if (processCache.get(acquired.sessionId!) === acquired.worker) processCache.delete(acquired.sessionId!);
+        });
+      }
+      await acquired.worker.close();
+    }
+    return output;
+  } catch (error) {
+    if (acquired.sessionId && processCache.get(acquired.sessionId) === acquired.worker) {
+      await withManagerLock(() => {
+        if (processCache.get(acquired.sessionId!) === acquired.worker) processCache.delete(acquired.sessionId!);
+      });
+    }
+    await acquired.worker.close();
+    throw error;
   }
 }

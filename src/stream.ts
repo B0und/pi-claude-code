@@ -383,6 +383,7 @@ export function streamClaudeCode(
         initialSystemMessages,
         nativeSystemInjections: nativeTranscript?.systemInjections,
         betas: nativeTranscript ? [NATIVE_TOOL_CHANGES_BETA] : undefined,
+        sessionId: options?.cacheRetention === "none" ? undefined : options?.sessionId,
         onEvent: (event) => translator.event(event),
       });
       translator.finish(
@@ -395,9 +396,9 @@ export function streamClaudeCode(
       output.diagnostics = [
         ...(output.diagnostics ?? []),
         {
-          type: "claude-code.admission",
+          type: "claude-code.turn-relay",
           timestamp: Date.now(),
-          details: response.admission as never,
+          details: response.relay as never,
         },
       ];
 
