@@ -4,6 +4,8 @@ import {
   createAssistantMessageEventStream,
   getCurrentSystemPrompt,
   getCurrentTools,
+  getInitialSystemMessage,
+  getSystemMessageText,
   type AssistantMessage,
   type AssistantMessageEventStream,
   type Model,
@@ -14,14 +16,16 @@ import {
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { runClaudeRequest } from "./claude-cli.ts";
-import { nativeModel } from "./model-catalog.ts";
+import { nativeModel, supportsNativeToolChanges } from "./model-catalog.ts";
 import type { AnthropicStreamEvent, NativeContentBlock, NativeMessage, NativeUsage } from "./native-types.ts";
 import {
   buildExtraBody,
   getInitialSystemMessages,
   getInitialUserPrefix,
   makeReplayDiagnostic,
+  NATIVE_TOOL_CHANGES_BETA,
   prepareFrames,
+  prepareNativeTranscript,
   prepareTools,
   TOOL_PREFIX,
 } from "./transcript.ts";
@@ -340,14 +344,27 @@ export function streamClaudeCode(
 
   void (async () => {
     try {
-      const transcript = collapseSystemMessages(context);
-      const systemPrompt = getCurrentSystemPrompt(transcript.messages);
+      const nativeTranscript = prepareNativeTranscript(
+        context.messages,
+        supportsNativeToolChanges(model.id),
+      );
+      const transcript = nativeTranscript ? context : collapseSystemMessages(context);
+      const initialSystem = getInitialSystemMessage(transcript.messages);
+      const systemPrompt = nativeTranscript
+        ? initialSystem
+          ? getSystemMessageText(initialSystem)
+          : ""
+        : getCurrentSystemPrompt(transcript.messages);
       const tools = getCurrentTools(transcript.messages);
       const frames = prepareFrames(transcript.messages);
       const initialUserPrefix = getInitialUserPrefix(transcript.messages);
       const initialSystemMessages = getInitialSystemMessages(transcript.messages);
       const preparedTools = prepareTools(tools);
-      const extraBody = buildExtraBody(model.id, preparedTools.nativeTools, options);
+      const extraBody = buildExtraBody(
+        model.id,
+        nativeTranscript?.requestTools ?? preparedTools.nativeTools,
+        options,
+      );
       const translator = new EventTranslator(model, output, stream, preparedTools.names);
 
       stream.push({ type: "start", partial: output });
@@ -364,6 +381,8 @@ export function streamClaudeCode(
         env: options?.env,
         initialUserPrefix,
         initialSystemMessages,
+        nativeSystemInjections: nativeTranscript?.systemInjections,
+        betas: nativeTranscript ? [NATIVE_TOOL_CHANGES_BETA] : undefined,
         onEvent: (event) => translator.event(event),
       });
       translator.finish(

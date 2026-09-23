@@ -20,6 +20,7 @@ export interface DiscoveredClaudeModel {
 
 const BUILTIN_ANTHROPIC_MODELS = ANTHROPIC_MODELS as unknown as Record<string, Model<"anthropic-messages">>;
 const NATIVE_ROUTE_BY_ID = new Map<string, string>();
+const NATIVE_TOOL_CHANGES_BY_ID = new Map<string, boolean>();
 
 const FALLBACK_DISCOVERY: DiscoveredClaudeModel[] = [
   {
@@ -133,6 +134,7 @@ export function modelFromDiscovery(info: DiscoveredClaudeModel): ClaudeCodeModel
   const builtinId = id === "default" ? withoutContextSuffix(info.resolvedModel || "") : id;
   const builtin = BUILTIN_ANTHROPIC_MODELS[builtinId];
   NATIVE_ROUTE_BY_ID.set(id, info.value);
+  NATIVE_TOOL_CHANGES_BY_ID.set(id, builtin?.compat?.supportsMidConvoToolChanges === true);
   return builtin ? fromBuiltin(info, id, builtin) : fallbackModel(info, id);
 }
 
@@ -152,6 +154,17 @@ export function supportsAdaptiveThinking(model: string): boolean {
   const withoutSuffix = withoutContextSuffix(model);
   const canonical = ALIASES[withoutSuffix] ?? withoutSuffix;
   return canonical !== "claude-haiku-4-5-20251001";
+}
+
+/** Whether Anthropic currently accepts native mid-conversation tool blocks for this route. */
+export function supportsNativeToolChanges(model: string): boolean {
+  const withoutSuffix = withoutContextSuffix(model);
+  const canonical = ALIASES[withoutSuffix] ?? withoutSuffix;
+  return (
+    NATIVE_TOOL_CHANGES_BY_ID.get(model) ??
+    NATIVE_TOOL_CHANGES_BY_ID.get(canonical) ??
+    BUILTIN_ANTHROPIC_MODELS[canonical]?.compat?.supportsMidConvoToolChanges === true
+  );
 }
 
 export function modelForDiscoveredRoute(route: string, label?: string): ClaudeCodeModel | undefined {

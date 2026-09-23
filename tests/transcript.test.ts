@@ -8,6 +8,7 @@ import {
   makeReplayDiagnostic,
   normalizeInputSchema,
   prepareFrames,
+  prepareNativeTranscript,
   prepareTools,
   TOOL_PREFIX,
 } from "../src/transcript.ts";
@@ -111,6 +112,81 @@ test("replays native signed blocks only while the visible projection is unchange
     { role: "user", content: "again", timestamp: 2 },
   ]);
   assert.deepEqual(edited[1]?.message.content, [{ type: "text", text: "edited" }]);
+});
+
+test("builds cache-stable native tool declarations and chronological system changes", () => {
+  const alpha = {
+    name: "alpha",
+    description: "alpha",
+    parameters: { type: "object", properties: {} },
+  } as unknown as Tool;
+  const beta = {
+    name: "beta",
+    description: "beta",
+    parameters: { type: "object", properties: {} },
+  } as unknown as Tool;
+  const assistant: AssistantMessage = {
+    role: "assistant",
+    api: "test",
+    provider: "claude-code",
+    model: "opus",
+    content: [{ type: "text", text: "one" }],
+    usage,
+    stopReason: "stop",
+    timestamp: 3,
+  };
+  const messages: Message[] = [
+    { role: "system", content: "base", toolsAdded: [alpha], timestamp: 0 },
+    { role: "user", content: "first", timestamp: 1 },
+    { role: "system", content: "beta is available", toolsAdded: [beta], timestamp: 2 },
+    assistant,
+    { role: "system", content: "alpha is gone", toolsRemoved: [{ name: "alpha" }], timestamp: 4 },
+    { role: "user", content: "second", timestamp: 5 },
+  ];
+
+  const plan = prepareNativeTranscript(messages, true)!;
+  assert.deepEqual(
+    plan.requestTools.map((tool) => [tool.name, tool.defer_loading ?? false]),
+    [
+      [`${TOOL_PREFIX}alpha`, false],
+      ["__pi_deferred_placeholder__", true],
+      [`${TOOL_PREFIX}beta`, true],
+    ],
+  );
+  assert.deepEqual(plan.requestTools[0]?.cache_control, { type: "ephemeral", ttl: "1h" });
+  assert.equal(plan.systemInjections[0]?.beforeAssistant, 0);
+  assert.deepEqual(plan.systemInjections[0]?.content, [
+    { type: "text", text: "beta is available" },
+    { type: "tool_addition", tool: { type: "tool_reference", name: `${TOOL_PREFIX}beta` } },
+  ]);
+  assert.equal(plan.systemInjections[1]?.beforeAssistant, null);
+  assert.deepEqual(plan.systemInjections[1]?.content, [
+    { type: "text", text: "alpha is gone" },
+    { type: "tool_removal", tool: { type: "tool_reference", name: `${TOOL_PREFIX}alpha` } },
+  ]);
+
+  assert.equal(prepareNativeTranscript(messages, false), undefined);
+  assert.equal(
+    prepareNativeTranscript(
+      [
+        { role: "system", content: "base", timestamp: 0 },
+        { role: "system", content: "late", toolsAdded: [alpha], timestamp: 1 },
+        { role: "user", content: "go", timestamp: 2 },
+      ],
+      true,
+    ),
+    undefined,
+  );
+  assert.equal(
+    prepareNativeTranscript(
+      [
+        ...messages,
+        { role: "system", content: "", toolsAdded: [{ ...alpha, description: "changed" }], timestamp: 6 },
+      ],
+      true,
+    ),
+    undefined,
+  );
 });
 
 test("normalizes tool schemas and builds native generation fields", () => {

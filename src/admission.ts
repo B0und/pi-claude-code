@@ -112,6 +112,7 @@ export class Admission {
   requestId?: string;
   failure?: string;
   errorBody = Buffer.alloc(0);
+  originalRequestBody?: Buffer;
   requestBody?: Buffer;
 
   private readonly upstream: URL;
@@ -127,6 +128,7 @@ export class Admission {
     private readonly timeoutMs = 180_000,
     onEvent?: (event: AnthropicStreamEvent) => void,
     private readonly transformRequest?: (body: Buffer) => Buffer,
+    private readonly requestBetas: string[] = [],
   ) {
     this.upstream = new URL(upstream);
     const loopback = ["127.0.0.1", "::1", "localhost"].includes(this.upstream.hostname);
@@ -216,6 +218,7 @@ export class Admission {
     let upstreamRequest: http.ClientRequest | undefined;
     try {
       let body = await this.readBody(request);
+      this.originalRequestBody = Buffer.from(body);
       if (this.transformRequest) body = this.transformRequest(body);
       this.requestBody = Buffer.from(body);
       if (this.cancelled) return;
@@ -226,6 +229,17 @@ export class Admission {
       }
       headers["accept-encoding"] = "identity";
       headers["content-length"] = body.length;
+      if (this.requestBetas.length > 0) {
+        const existing = Array.isArray(headers["anthropic-beta"])
+          ? headers["anthropic-beta"].join(",")
+          : String(headers["anthropic-beta"] ?? "");
+        headers["anthropic-beta"] = [
+          ...new Set([
+            ...existing.split(",").map((value) => value.trim()).filter(Boolean),
+            ...this.requestBetas,
+          ]),
+        ].join(",");
+      }
 
       const pathPrefix = this.upstream.pathname.replace(/\/$/u, "");
       const transport = this.upstream.protocol === "https:" ? https : http;

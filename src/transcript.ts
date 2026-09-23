@@ -1,17 +1,41 @@
-import type {
-  AssistantMessage,
-  ImageContent,
-  Message,
-  SimpleStreamOptions,
-  TextContent,
-  Tool,
-  ToolResultMessage,
+import {
+  getDeclaredTools,
+  getInitialSystemMessage,
+  hasToolRedefinitions,
+  renderSystemMessageUpdate,
+  type AssistantMessage,
+  type ImageContent,
+  type Message,
+  type SimpleStreamOptions,
+  type SystemMessage,
+  type TextContent,
+  type Tool,
+  type ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import { supportsAdaptiveThinking } from "./model-catalog.ts";
 import type { NativeContentBlock, NativeFrame, NativeMessage } from "./native-types.ts";
 
 export const TOOL_PREFIX = "mcp__pi__";
 export const NATIVE_REPLAY_DIAGNOSTIC = "claude-code.native-assistant.v1";
+export const NATIVE_TOOL_CHANGES_BETA = "mid-conversation-tool-changes-2026-07-01";
+
+const DEFERRED_TOOL_PLACEHOLDER = {
+  name: "__pi_deferred_placeholder__",
+  description: "Reserved placeholder. Never available. Never call this.",
+  input_schema: { type: "object", properties: {}, required: [] },
+  defer_loading: true,
+};
+
+export interface NativeSystemInjection {
+  /** Insert immediately before this zero-based assistant message, or at the request tail. */
+  beforeAssistant: number | null;
+  content: Array<Record<string, unknown>>;
+}
+
+export interface NativeTranscriptPlan {
+  requestTools: Array<Record<string, unknown>>;
+  systemInjections: NativeSystemInjection[];
+}
 
 interface ReplayCarrier {
   version: 1;
@@ -266,6 +290,75 @@ export function prepareTools(tools: Tool[]): {
     });
   }
   return { manifest, nativeTools, names };
+}
+
+function nativeSystemBlocks(message: SystemMessage): Array<Record<string, unknown>> {
+  const blocks: Array<Record<string, unknown>> = [];
+  const text = renderSystemMessageUpdate(message);
+  if (text) blocks.push({ type: "text", text: sanitizeSurrogates(text) });
+  for (const tool of message.toolsRemoved ?? []) {
+    blocks.push({
+      type: "tool_removal",
+      tool: { type: "tool_reference", name: `${TOOL_PREFIX}${tool.name}` },
+    });
+  }
+  for (const tool of message.toolsAdded ?? []) {
+    blocks.push({
+      type: "tool_addition",
+      tool: { type: "tool_reference", name: `${TOOL_PREFIX}${tool.name}` },
+    });
+  }
+  return blocks;
+}
+
+/**
+ * Build Anthropic's cache-preserving native representation of transcript tool changes.
+ * The placeholder keeps deferred-tool prompt scaffolding stable from the first request.
+ */
+export function prepareNativeTranscript(
+  messages: Message[],
+  supported: boolean,
+): NativeTranscriptPlan | undefined {
+  const initial = getInitialSystemMessage(messages);
+  const initialTools = initial?.toolsAdded ?? [];
+  if (!supported || initialTools.length === 0 || hasToolRedefinitions(messages)) return undefined;
+
+  const declared = getDeclaredTools(messages);
+  const prepared = prepareTools(declared);
+  const nativeByName = new Map(
+    prepared.nativeTools.map((tool) => [String(tool.name).slice(TOOL_PREFIX.length), tool]),
+  );
+  const initialNames = new Set(initialTools.map((tool) => tool.name));
+  const initialNative = initialTools.map((tool) => structuredClone(nativeByName.get(tool.name)!));
+  initialNative.at(-1)!.cache_control = { type: "ephemeral", ttl: "1h" };
+  const laterNative = declared
+    .filter((tool) => !initialNames.has(tool.name))
+    .map((tool) => ({ ...structuredClone(nativeByName.get(tool.name)!), defer_loading: true }));
+
+  const systemInjections: NativeSystemInjection[] = [];
+  let pending: Array<Array<Record<string, unknown>>> = [];
+  let assistantOrdinal = 0;
+  const flush = (beforeAssistant: number | null) => {
+    for (const content of pending) systemInjections.push({ beforeAssistant, content });
+    pending = [];
+  };
+
+  for (let index = 1; index < messages.length; index++) {
+    const message = messages[index]!;
+    if (message.role === "system") {
+      const blocks = nativeSystemBlocks(message);
+      if (blocks.length) pending.push(blocks);
+    } else if (message.role === "assistant" && assistantContent(message).length > 0) {
+      flush(assistantOrdinal);
+      assistantOrdinal += 1;
+    }
+  }
+  flush(null);
+
+  return {
+    requestTools: [...initialNative, structuredClone(DEFERRED_TOOL_PLACEHOLDER), ...laterNative],
+    systemInjections,
+  };
 }
 
 export function buildExtraBody(

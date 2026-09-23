@@ -15,10 +15,12 @@ function listen(server: http.Server): Promise<number> {
 
 test("admits one upstream Messages request and captures its SSE response", async () => {
   const upstreamBodies: string[] = [];
+  const upstreamBetas: string[] = [];
   const upstream = http.createServer(async (request, response) => {
     let body = "";
     for await (const chunk of request) body += chunk;
     upstreamBodies.push(body);
+    upstreamBetas.push(String(request.headers["anthropic-beta"] ?? ""));
     response.writeHead(200, { "content-type": "text/event-stream", "request-id": "req_test" });
     const usage = {
       input_tokens: 2,
@@ -43,11 +45,16 @@ test("admits one upstream Messages request and captures its SSE response", async
     5_000,
     (event) => observed.push(event.type),
     (body) => Buffer.from(JSON.stringify({ ...JSON.parse(body.toString("utf8")), rewritten: true })),
+    ["native-tools-test"],
   );
 
   try {
     const baseUrl = await admission.start();
-    const first = await fetch(`${baseUrl}/v1/messages`, { method: "POST", body: "{}" });
+    const first = await fetch(`${baseUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "anthropic-beta": "existing-test" },
+      body: "{}",
+    });
     assert.equal(first.status, 200);
     await first.text();
     const second = await fetch(`${baseUrl}/v1/messages`, { method: "POST", body: "{}" });
@@ -56,6 +63,8 @@ test("admits one upstream Messages request and captures its SSE response", async
 
     assert.equal(upstreamBodies.length, 1);
     assert.deepEqual(JSON.parse(upstreamBodies[0]!), { rewritten: true });
+    assert.deepEqual(JSON.parse(admission.originalRequestBody!.toString("utf8")), {});
+    assert.equal(upstreamBetas[0], "existing-test,native-tools-test");
     assert.equal(admission.used, true);
     assert.equal(admission.denied, 1);
     assert.equal(admission.capture.complete, true);

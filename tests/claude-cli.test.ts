@@ -79,6 +79,61 @@ test("stabilizes Claude Code's native replay reminders and cache breakpoint", ()
   );
 });
 
+test("injects native system history at assistant boundaries", () => {
+  const body = {
+    system: [
+      { type: "text", text: "identity", cache_control: { type: "ephemeral", ttl: "1h" } },
+      { type: "text", text: "prompt", cache_control: { type: "ephemeral", ttl: "1h" } },
+    ],
+    messages: [
+      { role: "user", content: [{ type: "text", text: "first" }] },
+      { role: "system", content: [{ type: "text", text: "environment" }] },
+      { role: "assistant", content: [{ type: "text", text: "answer" }] },
+      { role: "user", content: [{ type: "text", text: "second" }] },
+      { role: "system", content: [{ type: "text", text: "token reminder" }] },
+    ],
+  };
+  const rewritten = JSON.parse(
+    rewriteInitialRequest(Buffer.from(JSON.stringify(body)), undefined, body.messages[0]!.content, undefined, [
+      {
+        beforeAssistant: 0,
+        content: [{ type: "tool_addition", tool: { type: "tool_reference", name: "mcp__pi__beta" } }],
+      },
+      {
+        beforeAssistant: null,
+        content: [{ type: "tool_removal", tool: { type: "tool_reference", name: "mcp__pi__alpha" } }],
+      },
+    ]).toString("utf8"),
+  ) as typeof body;
+
+  assert.deepEqual(rewritten.messages.map((message) => message.role), [
+    "user",
+    "system",
+    "system",
+    "assistant",
+    "user",
+    "system",
+    "system",
+  ]);
+  assert.equal(
+    ((rewritten.messages[2]?.content as Array<Record<string, unknown>>)[0] as Record<string, unknown>).type,
+    "tool_addition",
+  );
+  assert.equal(
+    ((rewritten.messages.at(-1)?.content as Array<Record<string, unknown>>)[0] as Record<string, unknown>).type,
+    "tool_removal",
+  );
+  assert.equal((rewritten.system[0] as Record<string, unknown>).cache_control, undefined);
+  assert.deepEqual((rewritten.system[1] as Record<string, unknown>).cache_control, {
+    type: "ephemeral",
+    ttl: "1h",
+  });
+  assert.deepEqual(
+    (rewritten.messages.at(-1)?.content as Array<Record<string, unknown>>).at(-1)?.cache_control,
+    { type: "ephemeral", ttl: "1h" },
+  );
+});
+
 test("runs a request through a stream-json Claude executable", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-claude-code-test-"));
   const workingRoot = await realpath(root);

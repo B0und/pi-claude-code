@@ -16,7 +16,7 @@ import type {
   NativeResult,
   NativeUsage,
 } from "./native-types.ts";
-import type { ToolManifestEntry } from "./transcript.ts";
+import type { NativeSystemInjection, ToolManifestEntry } from "./transcript.ts";
 
 export const INSTALL_HINT =
   "Claude Code is not installed. Install it with `npm install -g @anthropic-ai/claude-code` " +
@@ -51,6 +51,10 @@ export interface RunClaudeInput {
   initialUserPrefix?: unknown[];
   /** Native system messages Claude Code injected immediately after that user message. */
   initialSystemMessages?: unknown[];
+  /** Pi system/tool deltas to restore at their historical assistant boundaries. */
+  nativeSystemInjections?: NativeSystemInjection[];
+  /** Beta features appended to Claude Code's own request header by the admission relay. */
+  betas?: string[];
   onEvent?: (event: AnthropicStreamEvent) => void;
 }
 
@@ -661,14 +665,60 @@ function removeRepeatedUserReminders(messages: NativeRequestMessage[], prefix: u
   }
 }
 
+function injectNativeSystemMessages(
+  messages: NativeRequestMessage[],
+  injections: NativeSystemInjection[],
+): NativeRequestMessage[] {
+  const byAssistant = new Map<number, NativeRequestMessage[]>();
+  const trailing: NativeRequestMessage[] = [];
+  for (const injection of injections) {
+    const message = { role: "system", content: structuredClone(injection.content) };
+    if (injection.beforeAssistant === null) trailing.push(message);
+    else {
+      const pending = byAssistant.get(injection.beforeAssistant) ?? [];
+      pending.push(message);
+      byAssistant.set(injection.beforeAssistant, pending);
+    }
+  }
+
+  const output: NativeRequestMessage[] = [];
+  let assistantOrdinal = 0;
+  for (const message of messages) {
+    if (message.role === "assistant") {
+      output.push(...(byAssistant.get(assistantOrdinal) ?? []));
+      byAssistant.delete(assistantOrdinal);
+      assistantOrdinal += 1;
+    }
+    output.push(message);
+  }
+  if (byAssistant.size > 0) throw new Error("Claude Code request lost an assistant boundary needed by system history");
+  output.push(...trailing);
+  return output;
+}
+
+function normalizeLeadingSystemCache(system: unknown): void {
+  if (!Array.isArray(system)) return;
+  for (const block of system) {
+    if (block && typeof block === "object") delete (block as Record<string, unknown>).cache_control;
+  }
+  const last = system.at(-1);
+  if (last && typeof last === "object") {
+    (last as Record<string, unknown>).cache_control = { type: "ephemeral", ttl: "1h" };
+  }
+}
+
 export function rewriteInitialRequest(
   body: Buffer,
   prefix: unknown[] | undefined,
   canonicalContent: unknown[],
   initialSystemMessages: unknown[] | undefined,
+  nativeSystemInjections?: NativeSystemInjection[],
 ): Buffer {
-  const payload = JSON.parse(body.toString("utf8")) as { messages?: NativeRequestMessage[] };
-  const messages = payload.messages;
+  const payload = JSON.parse(body.toString("utf8")) as {
+    messages?: NativeRequestMessage[];
+    system?: unknown;
+  };
+  let messages = payload.messages;
   const first = messages?.[0];
   if (first?.role !== "user" || !Array.isArray(first.content)) {
     throw new Error("Claude Code request is missing its initial user message");
@@ -689,8 +739,14 @@ export function rewriteInitialRequest(
       messages.pop();
     }
     removeRepeatedUserReminders(messages, prefix);
-    setReplayCacheBreakpoints(messages);
   }
+
+  if (nativeSystemInjections) {
+    messages = injectNativeSystemMessages(messages!, nativeSystemInjections);
+    payload.messages = messages;
+    normalizeLeadingSystemCache(payload.system);
+  }
+  if (initialSystemMessages?.length || nativeSystemInjections) setReplayCacheBreakpoints(messages!);
 
   return Buffer.from(JSON.stringify(payload));
 }
@@ -730,15 +786,17 @@ export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaude
       input.upstreamUrl ?? "https://api.anthropic.com",
       timeoutMs,
       deliver,
-      input.initialUserPrefix || input.initialSystemMessages
+      input.initialUserPrefix || input.initialSystemMessages || input.nativeSystemInjections
         ? (body) =>
             rewriteInitialRequest(
               body,
               input.initialUserPrefix,
               canonicalInitialUser,
               input.initialSystemMessages,
+              input.nativeSystemInjections,
             )
         : undefined,
+      input.betas,
     );
     env.ANTHROPIC_BASE_URL = await admission.start();
 
@@ -907,9 +965,9 @@ export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaude
           requestId: admission.requestId,
         },
         initialUserPrefix:
-          input.initialUserPrefix ?? deriveInitialUserPrefix(admission.requestBody, canonicalInitialUser),
+          input.initialUserPrefix ?? deriveInitialUserPrefix(admission.originalRequestBody, canonicalInitialUser),
         initialSystemMessages:
-          input.initialSystemMessages ?? deriveInitialSystemMessages(admission.requestBody),
+          input.initialSystemMessages ?? deriveInitialSystemMessages(admission.originalRequestBody),
       };
     } finally {
       input.signal?.removeEventListener("abort", abort);

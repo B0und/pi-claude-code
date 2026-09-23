@@ -4,6 +4,7 @@ import {
   CLAUDE_CODE_MODELS,
   modelFromDiscovery,
   nativeModel,
+  supportsNativeToolChanges,
 } from "../src/model-catalog.ts";
 
 test("fallback catalog matches Claude Code's selectable model families", () => {
@@ -20,6 +21,10 @@ test("fallback catalog matches Claude Code's selectable model families", () => {
   assert.equal(nativeModel("default"), "default");
   assert.equal(nativeModel("claude-opus-5-5"), "opus[1m]");
   assert.equal(nativeModel("claude-sonnet-5"), "sonnet");
+  assert.equal(supportsNativeToolChanges("default"), true);
+  assert.equal(supportsNativeToolChanges("claude-opus-5-5"), true);
+  assert.equal(supportsNativeToolChanges("claude-fable-5-1"), true);
+  assert.equal(supportsNativeToolChanges("claude-sonnet-5"), false);
 });
 
 test("maps discovered aliases to stable canonical Pi model ids", () => {
