@@ -1,9 +1,16 @@
 {
-  "name": "pi-claude-code",
+  "name": "@earendil-works/pi-claude-code",
   "version": "0.1.0",
   "description": "Experimental pi provider for Claude Pro/Max subscriptions through Claude Code",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/earendil-works/pi-claude-code.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "pi-package",
     "claude",
