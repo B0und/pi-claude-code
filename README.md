@@ -6,6 +6,23 @@ routing all Claude model requests through the official Claude Code CLI.
 Pi still handles conversation history, approvals, compaction, and tool
 execution. Claude Code only talks to the model. It never runs tools itself.
 
+> [!WARNING]
+> **The future of this extension is uncertain.** Right now it works by running
+> Pi's requests through the official Claude Code CLI in non-interactive mode
+> (`claude -p`), and that usage counts against your normal Claude subscription
+> limits. In May 2026 Anthropic
+> [announced](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)
+> that `claude -p`, Agent SDK, and third-party usage would move to a separate,
+> smaller "Agent SDK credit" billed at API rates. Anthropic has since put that
+> change on hold and says it will give advance notice before any future change.
+>
+> Until then the extension keeps working as described here, but that could
+> change at any time. If Anthropic changes how `claude -p` usage is billed, this
+> extension may cost more, stop drawing from your subscription, or stop working
+> altogether. See Zed's
+> [write-up](https://zed.dev/blog/anthropic-subscription-changes) for more
+> background.
+
 ## Requirements
 
 - Pi
