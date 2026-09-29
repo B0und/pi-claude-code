@@ -7,7 +7,6 @@ import {
   cachedClaudeProcessCount,
   closeClaudeProcesses,
   discoverClaudeModels,
-  loginClaudeCode,
   rewriteInitialRequest,
   runClaudeRequest,
 } from "../src/claude-cli.ts";
@@ -154,20 +153,6 @@ if (process.argv.includes("auth") && process.argv.includes("status")) {
   console.log(JSON.stringify({loggedIn: true, authMethod: "claude.ai", subscriptionType: "test"}));
   process.exit(0);
 }
-if (process.argv.includes("auth") && process.argv.includes("login")) {
-  console.log("Opening browser: https://claude.com/cai/oauth/authorize?state=test");
-  if (process.env.AUTO_LOGIN === "1") {
-    await new Promise(resolve => setTimeout(resolve, 25));
-    process.exit(0);
-  }
-  const loginInput = readline.createInterface({input: process.stdin, crlfDelay: Infinity});
-  for await (const code of loginInput) {
-    if (code.trim() !== "test-code") process.exit(2);
-    console.log("Login successful");
-    process.exit(0);
-  }
-  process.exit(3);
-}
 if (process.cwd() !== process.env.EXPECTED_CWD) throw new Error(\`wrong cwd: \${process.cwd()}\`);
 if (process.env.PROCESS_LOG) appendFileSync(process.env.PROCESS_LOG, \`\${process.pid}\\n\`);
 const systemIndex = process.argv.indexOf("--system-prompt-file");
@@ -240,40 +225,14 @@ for await (const line of input) {
     });
     assert.equal(authCheck?.type, "oauth");
     assert.equal(provider.auth.oauth?.isSubscription, true);
-    const authEvents: string[] = [];
-    const credential = await provider.auth.oauth!.login({
-      signal: new AbortController().signal,
-      prompt: async (prompt) => {
-        assert.equal(prompt.type, "manual_code");
-        return "test-code";
-      },
-      notify: (event) => authEvents.push(event.type),
-    });
-    assert.equal(credential.type, "oauth");
-    assert.equal(credential.access, "claude-code-external");
-    assert.ok(authEvents.includes("info"));
-
-    let autoPromptDismissed = false;
-    const autoStatus = await loginClaudeCode(
-      {
+    await assert.rejects(
+      provider.auth.oauth!.login({
         signal: new AbortController().signal,
-        prompt: (prompt) =>
-          new Promise<string>((_resolve, reject) => {
-            prompt.signal?.addEventListener(
-              "abort",
-              () => {
-                autoPromptDismissed = true;
-                reject(new Error("dismissed"));
-              },
-              { once: true },
-            );
-          }),
+        prompt: async () => "",
         notify: () => {},
-      },
-      { PI_CLAUDE_CODE_COMMAND: executable, AUTO_LOGIN: "1" },
+      }),
+      /claude auth login/,
     );
-    assert.equal(autoStatus.subscription, true);
-    assert.equal(autoPromptDismissed, true);
 
     const discovered = await discoverClaudeModels(
       { PI_CLAUDE_CODE_COMMAND: executable, EXPECTED_CWD: process.cwd() },

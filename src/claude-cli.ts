@@ -6,7 +6,7 @@ import { delimiter, dirname, extname, isAbsolute, join, resolve } from "node:pat
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { spawn, type ChildProcess } from "node:child_process";
-import { registerSessionResourceCleanup, type ProviderAuthInteraction } from "@earendil-works/pi-ai";
+import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { TurnRelay } from "./turn-relay.ts";
 import type { DiscoveredClaudeModel } from "./model-catalog.ts";
 import type {
@@ -173,118 +173,6 @@ export async function getClaudeStatus(
   } catch (error) {
     if (signal?.aborted) throw error;
     return { available: true, loggedIn: false, subscription: false, command, detail: LOGIN_HINT };
-  }
-}
-
-/** Run Claude Code's own browser login while Pi renders the URL and code prompt. */
-export async function loginClaudeCode(
-  interaction: ProviderAuthInteraction,
-  envInput: Record<string, string | undefined> = process.env,
-): Promise<ClaudeStatus> {
-  interaction.signal.throwIfAborted();
-  const env = withConfigDirectory({ ...process.env, ...envInput });
-  const command = await resolveClaudeExecutable(env);
-  if (!command) throw new Error(INSTALL_HINT);
-
-  interaction.notify({ type: "progress", message: "Starting Claude Code subscription login…" });
-  const child = spawnCommand(command, ["auth", "login", "--claudeai"], {
-    cwd: process.cwd(),
-    env,
-    detached: process.platform !== "win32",
-    windowsHide: true,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  let stdout = "";
-  let stderr = "";
-  let resolveUrl!: (url: string) => void;
-  let rejectUrl!: (error: Error) => void;
-  let sawUrl = false;
-  const urlPromise = new Promise<string>((resolve, reject) => {
-    resolveUrl = resolve;
-    rejectUrl = reject;
-  });
-  const inspectOutput = (chunk: string) => {
-    stdout = (stdout + chunk).slice(-65_536);
-    if (sawUrl) return;
-    const match = /https:\/\/claude\.com\/cai\/oauth\/authorize\?[^\s\x07\x1b]+/u.exec(stdout);
-    if (match) {
-      sawUrl = true;
-      resolveUrl(match[0]);
-    }
-  };
-  child.stdout?.setEncoding("utf8");
-  child.stderr?.setEncoding("utf8");
-  child.stdout?.on("data", inspectOutput);
-  child.stderr?.on("data", (chunk: string) => (stderr = (stderr + chunk).slice(-65_536)));
-  child.once("error", (error) => rejectUrl(error));
-  child.once("exit", (code) => {
-    if (!sawUrl) rejectUrl(new Error(`Claude Code login exited before presenting an authorization URL (${code})`));
-  });
-
-  const abort = () => killProcessTree(child);
-  interaction.signal.addEventListener("abort", abort, { once: true });
-  const exitPromise = childExit(child);
-  try {
-    const url = await urlPromise;
-    // Claude Code opens the browser itself. Show the captured URL as a
-    // fallback without asking Pi to open a duplicate browser tab.
-    interaction.notify({
-      type: "info",
-      message: "Claude Code opened a browser for subscription login.",
-      links: [{ url, label: "Open the authorization page" }],
-    });
-    const promptAbort = new AbortController();
-    const promptOutcome = interaction
-      .prompt({
-        type: "manual_code",
-        message: "Paste the authorization code shown after signing in (only if requested)",
-        signal: promptAbort.signal,
-      })
-      .then(
-        (code) => ({ kind: "code" as const, code }),
-        (error: unknown) => ({ kind: "prompt-error" as const, error }),
-      );
-    const exitOutcome = exitPromise.then(
-      (code) => ({ kind: "exit" as const, code }),
-      (error: unknown) => ({ kind: "exit-error" as const, error }),
-    );
-    const first = await Promise.race([promptOutcome, exitOutcome]);
-
-    let exitCode: number;
-    if (first.kind === "exit") {
-      // Browser callback completed the CLI flow. Abort Pi's optional manual
-      // input so the login dialog dismisses immediately.
-      promptAbort.abort();
-      exitCode = first.code;
-    } else if (first.kind === "exit-error") {
-      promptAbort.abort();
-      throw first.error;
-    } else if (first.kind === "prompt-error") {
-      throw first.error;
-    } else {
-      interaction.signal.throwIfAborted();
-      if (!first.code.trim()) throw new Error("Claude Code login returned an empty authorization code");
-      child.stdin?.end(`${first.code.trim()}\n`);
-      interaction.notify({ type: "progress", message: "Completing Claude Code login…" });
-      const completed = await exitOutcome;
-      if (completed.kind === "exit-error") throw completed.error;
-      exitCode = completed.code;
-    }
-
-    interaction.signal.throwIfAborted();
-    if (exitCode !== 0) {
-      const detail = (stderr || stdout).trim().slice(-500);
-      throw new Error(`Claude Code login failed${detail ? `: ${detail}` : ""}`);
-    }
-    const status = await getClaudeStatus(env, interaction.signal);
-    if (!status.loggedIn) throw new Error(LOGIN_HINT);
-    if (!status.subscription) {
-      throw new Error("Claude Code logged in without a Claude subscription; retry with `claude auth login --claudeai`");
-    }
-    return status;
-  } finally {
-    interaction.signal.removeEventListener("abort", abort);
-    if (child.exitCode === null) killProcessTree(child);
   }
 }
 

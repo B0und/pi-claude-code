@@ -1,5 +1,5 @@
 import { createProvider, type AuthContext, type ProviderEnv } from "@earendil-works/pi-ai";
-import { discoverClaudeModels, getClaudeStatus, LOGIN_HINT, loginClaudeCode } from "./claude-cli.ts";
+import { discoverClaudeModels, getClaudeStatus, LOGIN_HINT } from "./claude-cli.ts";
 import { API_ID, CLAUDE_CODE_MODELS, modelFromDiscovery, PROVIDER_ID } from "./model-catalog.ts";
 import { streamClaudeCode } from "./stream.ts";
 
@@ -39,6 +39,9 @@ export function createClaudeCodeProvider() {
           const providerEnv = await providerEnvironment(ctx);
           lastProviderEnv = providerEnv;
           const status = await getClaudeStatus({ ...process.env, ...providerEnv }, signal);
+          // Only report the provider as configured when Claude Code is
+          // installed and logged in, so Pi hides its models otherwise.
+          if (!status.available || !status.loggedIn) return undefined;
           return {
             type: status.subscription ? "oauth" : "api_key",
             source: status.subscription ? `Claude Code ${status.plan ?? "subscription"}` : "Claude Code CLI",
@@ -57,13 +60,15 @@ export function createClaudeCodeProvider() {
       },
       // Metadata marker for Pi's subscription-aware UI. This is deliberately
       // not the request auth path and never imports Claude Code credentials.
+      // Login and logout are handled by the Claude Code CLI itself.
       oauth: {
         name: "Claude Code subscription (managed by Claude Code)",
         isSubscription: true,
-        loginLabel: "Sign in through Claude Code",
-        async login(interaction) {
-          await loginClaudeCode(interaction, { ...process.env, ...lastProviderEnv });
-          return externalOAuthMarker();
+        async login() {
+          throw new Error(
+            "Claude Code manages its own login. Run `claude auth login` in a terminal instead; " +
+              "this provider uses it automatically.",
+          );
         },
         async refresh(_credential, signal) {
           const status = await getClaudeStatus({ ...process.env, ...lastProviderEnv }, signal);
