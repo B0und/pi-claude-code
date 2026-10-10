@@ -1,3 +1,5 @@
+import type { RateLimitInfo } from "./billing.ts";
+
 export type JsonRecord = Record<string, unknown>;
 
 export interface NativeUsage extends JsonRecord {
@@ -53,6 +55,7 @@ export type NativeOutputEvent =
   | { type: "assistant"; message: NativeMessage; error?: unknown }
   | NativeResult
   | { type: "stream_event"; event: AnthropicStreamEvent }
+  | { type: "rate_limit_event"; rate_limit_info?: RateLimitInfo }
   | { type: "control_response"; response: JsonRecord };
 
 export type AnthropicStreamEvent =

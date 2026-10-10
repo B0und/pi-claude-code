@@ -33,6 +33,16 @@ starts a flow; it tells the user to run `claude auth login`.
 Inherited API-key, proxy, Bedrock, Vertex, and Foundry overrides are rejected
 to avoid silently changing authentication or billing.
 
+## Usage-credit guard
+
+Claude Code emits a `rate_limit_event` for each turn. If it reports
+`isUsingOverage`, the response was charged to usage credits rather than plan
+limits, and the turn fails with a non-retryable `Claude Code billing` error
+unless `PI_CLAUDE_CODE_ALLOW_USAGE_CREDITS` is set. Upstream rejections that
+ask for usage credits (for example third-party app classification) are
+rewritten into the same kind of error. The latest rate-limit status is attached
+to the assistant message as a `claude-code.rate-limit` diagnostic.
+
 ## Process reuse
 
 Linear conversations may reuse a warm Claude Code process. Only exact linear

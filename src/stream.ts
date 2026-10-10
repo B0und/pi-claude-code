@@ -15,6 +15,7 @@ import {
   type ToolCall,
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
+import { describeUsageCreditsRejection } from "./billing.ts";
 import { runClaudeRequest } from "./claude-cli.ts";
 import { nativeModel, supportsNativeToolChanges } from "./model-catalog.ts";
 import type { AnthropicStreamEvent, NativeContentBlock, NativeMessage, NativeUsage } from "./native-types.ts";
@@ -317,8 +318,10 @@ class EventTranslator {
   }
 }
 
-function normalizeError(error: unknown): string {
+export function normalizeError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
+  const usageCredits = describeUsageCreditsRejection(message);
+  if (usageCredits) return usageCredits;
   if (/prompt is too long|context(?:_| )length|context window exceeded|too many input tokens/iu.test(message)) {
     return `context_length_exceeded: ${message}`;
   }
@@ -400,6 +403,15 @@ export function streamClaudeCode(
           timestamp: Date.now(),
           details: response.relay as never,
         },
+        ...(response.rateLimit
+          ? [
+              {
+                type: "claude-code.rate-limit",
+                timestamp: Date.now(),
+                details: response.rateLimit as never,
+              },
+            ]
+          : []),
       ];
 
       if (output.stopReason === "error" || output.stopReason === "aborted" || output.stopReason === "pending") {

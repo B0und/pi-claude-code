@@ -8,6 +8,7 @@ import { createInterface } from "node:readline";
 import { spawn, type ChildProcess } from "node:child_process";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { TurnRelay } from "./turn-relay.ts";
+import { usageCreditsAllowed, usageCreditsChargeError, type RateLimitInfo } from "./billing.ts";
 import type { DiscoveredClaudeModel } from "./model-catalog.ts";
 import type {
   AnthropicStreamEvent,
@@ -73,6 +74,8 @@ export interface RunClaudeOutput {
   };
   initialUserPrefix?: unknown[];
   initialSystemMessages?: unknown[];
+  /** Latest plan-limit status Claude Code reported for this turn. */
+  rateLimit?: RateLimitInfo;
 }
 
 function configuredCommand(env: Record<string, string | undefined>): string {
@@ -907,6 +910,7 @@ class ClaudeProcess {
     const assistants: NativeMessage[] = [];
     let result: NativeResult | undefined;
     let nativeError: string | undefined;
+    let rateLimit: RateLimitInfo | undefined;
 
     try {
       const frames = continuation ? input.frames.slice(-1) : input.frames;
@@ -936,6 +940,8 @@ class ClaudeProcess {
         } else if (event.type === "result") {
           result = event;
           break;
+        } else if (event.type === "rate_limit_event") {
+          if (event.rate_limit_info && typeof event.rate_limit_info === "object") rateLimit = event.rate_limit_info;
         } else if (event.type === "stream_event" && !this.relay.used) {
           deliver(event.event);
         }
@@ -985,6 +991,12 @@ class ClaudeProcess {
         throw new Error("Claude Code response did not include complete token usage");
       }
 
+      // The response is already charged at this point, but stopping here keeps
+      // Pi's agent loop from issuing more requests against usage credits.
+      if (rateLimit?.isUsingOverage === true && !usageCreditsAllowed({ ...process.env, ...input.env })) {
+        throw usageCreditsChargeError(rateLimit);
+      }
+
       return {
         message,
         result,
@@ -999,6 +1011,7 @@ class ClaudeProcess {
           input.initialUserPrefix ?? deriveInitialUserPrefix(this.relay.originalRequestBody, canonicalInitialUser),
         initialSystemMessages:
           input.initialSystemMessages ?? deriveInitialSystemMessages(this.relay.originalRequestBody),
+        rateLimit,
       };
     } finally {
       input.signal?.removeEventListener("abort", abort);
