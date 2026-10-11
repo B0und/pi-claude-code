@@ -76,4 +76,5 @@ export type AnthropicStreamEvent =
       delta: { stop_reason?: string | null; stop_sequence?: string | null; [key: string]: unknown };
       usage?: Partial<NativeUsage>;
     }
-  | { type: "message_stop" };
+  | { type: "message_stop" }
+  | { type: "error"; error?: { type?: string; message?: string } };

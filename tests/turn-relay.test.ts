@@ -90,3 +90,33 @@ test("relays one upstream Messages request and captures its SSE response", async
     await new Promise<void>((resolve) => upstream.close(() => resolve()));
   }
 });
+
+test("surfaces an error event from an otherwise successful SSE stream", async () => {
+  const upstream = http.createServer(async (request, response) => {
+    for await (const _chunk of request);
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    const usage = { input_tokens: 2, output_tokens: 0 };
+    response.end(
+      [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m1", role: "assistant", content: [], usage } })}\n\n`,
+        `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } })}\n\n`,
+      ].join(""),
+    );
+  });
+  const upstreamPort = await listen(upstream);
+  const relay = new TurnRelay(`http://127.0.0.1:${upstreamPort}`, 5_000);
+
+  try {
+    const baseUrl = await relay.start();
+    const response = await fetch(`${baseUrl}/v1/messages`, { method: "POST", body: "{}" });
+    assert.equal(response.status, 200);
+    await response.text();
+    await relay.settled();
+
+    assert.equal(relay.capture.complete, false);
+    assert.equal(relay.errorText(), "overloaded_error: Overloaded");
+  } finally {
+    await relay.close();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});

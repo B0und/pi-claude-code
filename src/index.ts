@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getClaudeStatus } from "./claude-cli.ts";
-import { createClaudeCodeProvider } from "./provider.ts";
+import { claudeCodeEnv, createClaudeCodeProvider } from "./provider.ts";
 
 export default function claudeCodeExtension(pi: ExtensionAPI): void {
   pi.registerProvider(createClaudeCodeProvider());
@@ -8,7 +8,7 @@ export default function claudeCodeExtension(pi: ExtensionAPI): void {
   pi.registerCommand("claude-code-status", {
     description: "Check the Claude Code executable and subscription login",
     handler: async (_args, ctx) => {
-      const status = await getClaudeStatus(process.env, ctx.signal);
+      const status = await getClaudeStatus(claudeCodeEnv(), ctx.signal);
       if (!status.available || !status.loggedIn) {
         ctx.ui.notify(status.detail ?? "Claude Code is not ready", "error");
         return;

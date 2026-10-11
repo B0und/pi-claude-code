@@ -16,9 +16,18 @@ async function providerEnvironment(ctx: AuthContext): Promise<ProviderEnv | unde
   return Object.keys(env).length ? env : undefined;
 }
 
+// Pi resolves provider-scoped settings (such as PI_CLAUDE_CODE_COMMAND) only
+// through auth hooks. Remember the latest values so model discovery and the
+// status command look at the same Claude Code installation as requests do.
+let lastProviderEnv: ProviderEnv | undefined;
+
+/** The environment used to locate and configure Claude Code. */
+export function claudeCodeEnv(): Record<string, string | undefined> {
+  return { ...process.env, ...lastProviderEnv };
+}
+
 export function createClaudeCodeProvider() {
   let discoveredIds: Set<string> | undefined;
-  let lastProviderEnv: ProviderEnv | undefined;
   const externalOAuthMarker = () => ({
     type: "oauth" as const,
     access: "claude-code-external",
@@ -38,7 +47,7 @@ export function createClaudeCodeProvider() {
         async check({ ctx, signal }) {
           const providerEnv = await providerEnvironment(ctx);
           lastProviderEnv = providerEnv;
-          const status = await getClaudeStatus({ ...process.env, ...providerEnv }, signal);
+          const status = await getClaudeStatus(claudeCodeEnv(), signal);
           // Only report the provider as configured when Claude Code is
           // installed and logged in, so Pi hides its models otherwise.
           if (!status.available || !status.loggedIn) return undefined;
@@ -71,7 +80,7 @@ export function createClaudeCodeProvider() {
           );
         },
         async refresh(_credential, signal) {
-          const status = await getClaudeStatus({ ...process.env, ...lastProviderEnv }, signal);
+          const status = await getClaudeStatus(claudeCodeEnv(), signal);
           if (!status.subscription) throw new Error(LOGIN_HINT);
           return externalOAuthMarker();
         },
@@ -82,7 +91,7 @@ export function createClaudeCodeProvider() {
     },
     models: CLAUDE_CODE_MODELS,
     async fetchModels({ signal }) {
-      const models = (await discoverClaudeModels(process.env, signal)).map(modelFromDiscovery);
+      const models = (await discoverClaudeModels(claudeCodeEnv(), signal)).map(modelFromDiscovery);
       discoveredIds = new Set(models.map((model) => model.id));
       return models;
     },

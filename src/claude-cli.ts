@@ -9,6 +9,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { TurnRelay } from "./turn-relay.ts";
 import { usageCreditsAllowed, usageCreditsChargeError, type RateLimitInfo } from "./billing.ts";
+import { envFlagEnabled } from "./env.ts";
 import type { DiscoveredClaudeModel } from "./model-catalog.ts";
 import type {
   AnthropicStreamEvent,
@@ -18,7 +19,7 @@ import type {
   NativeResult,
   NativeUsage,
 } from "./native-types.ts";
-import type { NativeSystemInjection, ToolManifestEntry } from "./transcript.ts";
+import { TOOL_PREFIX, type NativeSystemInjection, type ToolManifestEntry } from "./transcript.ts";
 
 export const INSTALL_HINT =
   "Claude Code is not installed. Install it with `npm install -g @anthropic-ai/claude-code` " +
@@ -177,6 +178,33 @@ export async function getClaudeStatus(
     if (signal?.aborted) throw error;
     return { available: true, loggedIn: false, subscription: false, command, detail: LOGIN_HINT };
   }
+}
+
+const READY_STATUS_TTL_MS = 60_000;
+const readyStatusCache = new Map<string, { command: string; expires: number }>();
+
+/**
+ * Resolve a logged-in Claude Code executable. Successful checks are cached
+ * briefly because a fresh worker is spawned after every tool call, and an
+ * extra `claude auth status` process on each of those turns adds latency.
+ */
+async function readyClaudeCommand(
+  envInput: Record<string, string | undefined>,
+  signal?: AbortSignal,
+): Promise<string> {
+  const env = withConfigDirectory(envInput);
+  const key = JSON.stringify([configuredCommand(env), env.PATH, env.HOME, env.CLAUDE_CONFIG_DIR]);
+  const cached = readyStatusCache.get(key);
+  if (cached && cached.expires > Date.now()) return cached.command;
+
+  const status = await getClaudeStatus(env, signal);
+  if (!status.available || !status.command) throw new Error(INSTALL_HINT);
+  if (!status.loggedIn) {
+    readyStatusCache.delete(key);
+    throw new Error(LOGIN_HINT);
+  }
+  readyStatusCache.set(key, { command: status.command, expires: Date.now() + READY_STATUS_TTL_MS });
+  return status.command;
 }
 
 function isDiscoveredModel(value: unknown): value is DiscoveredClaudeModel {
@@ -387,7 +415,7 @@ function conflictingEnvironment(env: Record<string, string>): string[] {
     (key) => !!env[key],
   );
   for (const key of ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"]) {
-    if (env[key] && !["0", "false", "no", "off"].includes(env[key]!.toLowerCase())) conflicts.push(key);
+    if (envFlagEnabled(env[key])) conflicts.push(key);
   }
   return conflicts;
 }
@@ -645,7 +673,6 @@ export function rewriteInitialRequest(
   return Buffer.from(JSON.stringify(payload));
 }
 
-const CLAUDE_PROCESS_IDLE_TTL_MS = 5 * 60 * 1_000;
 const CLAUDE_PROCESS_MAX_AGE_MS = 5 * 60 * 1_000;
 const MAX_CACHED_CLAUDE_PROCESSES = 2;
 
@@ -705,8 +732,9 @@ class ClaudeProcess {
   lastUsed = this.createdAt;
 
   private tipHash?: string;
-  private idleTimer?: NodeJS.Timeout;
+  private expiryTimer?: NodeJS.Timeout;
   private closed = false;
+  private stderr = "";
 
   private constructor(
     readonly fingerprint: string,
@@ -717,15 +745,14 @@ class ClaudeProcess {
     private readonly readTask: Promise<void>,
     private readonly exitOutcome: Promise<{ code?: number; error?: Error }>,
     private readonly timeoutMs: number,
-    private stderr: string,
-  ) {}
+  ) {
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => (this.stderr = (this.stderr + chunk).slice(-65_536)));
+  }
 
   static async create(input: RunClaudeInput, plan: ClaudeLaunchPlan): Promise<ClaudeProcess> {
     input.signal?.throwIfAborted();
-    const effectiveInputEnv = { ...process.env, ...input.env };
-    const status = await getClaudeStatus(effectiveInputEnv, input.signal);
-    if (!status.available || !status.command) throw new Error(INSTALL_HINT);
-    if (!status.loggedIn) throw new Error(LOGIN_HINT);
+    const command = await readyClaudeCommand({ ...process.env, ...input.env }, input.signal);
 
     const root = await mkdtemp(join(tmpdir(), "pi-claude-code-"));
     const toolsPath = join(root, "tools.json");
@@ -778,7 +805,7 @@ class ClaudeProcess {
         JSON.stringify(mcp),
       ];
 
-      child = spawnCommand(status.command, args, {
+      child = spawnCommand(command, args, {
         // Claude Code tells the model its process cwd. Keep transport files
         // private while exposing Pi's real working directory to the model.
         cwd: input.cwd ?? process.cwd(),
@@ -787,10 +814,6 @@ class ClaudeProcess {
         windowsHide: true,
         stdio: ["pipe", "pipe", "pipe"],
       });
-      let stderr = "";
-      child.stderr?.setEncoding("utf8");
-      child.stderr?.on("data", (chunk: string) => (stderr = (stderr + chunk).slice(-65_536)));
-
       const queue = new AsyncQueue<NativeOutputEvent>();
       const reader = createInterface({ input: child.stdout!, crlfDelay: Infinity });
       const readTask = (async () => {
@@ -812,20 +835,7 @@ class ClaudeProcess {
         (code) => ({ code }),
         (error: unknown) => ({ error: error instanceof Error ? error : new Error(String(error)) }),
       );
-      const worker = new ClaudeProcess(
-        plan.fingerprint,
-        root,
-        child,
-        relay,
-        queue,
-        readTask,
-        exitOutcome,
-        plan.timeoutMs,
-        stderr,
-      );
-      // Keep reading the closure rather than the constructor's initial string.
-      child.stderr?.on("data", (chunk: string) => (worker.stderr = (worker.stderr + chunk).slice(-65_536)));
-      return worker;
+      return new ClaudeProcess(plan.fingerprint, root, child, relay, queue, readTask, exitOutcome, plan.timeoutMs);
     } catch (error) {
       relay?.abort();
       if (child && child.exitCode === null) killProcessTree(child);
@@ -840,7 +850,7 @@ class ClaudeProcess {
   }
 
   isExpired(now = Date.now()): boolean {
-    return now - this.createdAt >= CLAUDE_PROCESS_MAX_AGE_MS || now - this.lastUsed >= CLAUDE_PROCESS_IDLE_TTL_MS;
+    return now - this.createdAt >= CLAUDE_PROCESS_MAX_AGE_MS;
   }
 
   canContinue(input: RunClaudeInput): boolean {
@@ -848,17 +858,18 @@ class ClaudeProcess {
     return frameHistoryHash(input.frames.slice(0, -1)) === this.tipHash;
   }
 
-  clearIdleTimer(): void {
-    if (this.idleTimer) clearTimeout(this.idleTimer);
-    this.idleTimer = undefined;
+  clearExpiryTimer(): void {
+    if (this.expiryTimer) clearTimeout(this.expiryTimer);
+    this.expiryTimer = undefined;
   }
 
-  armIdleTimer(expire: () => void): void {
-    this.clearIdleTimer();
+  /** Mark the worker idle and schedule its close for the end of its lifetime. */
+  armExpiryTimer(expire: () => void): void {
+    this.clearExpiryTimer();
     this.lastUsed = Date.now();
     const remainingLifetime = CLAUDE_PROCESS_MAX_AGE_MS - (this.lastUsed - this.createdAt);
-    this.idleTimer = setTimeout(expire, Math.max(0, Math.min(CLAUDE_PROCESS_IDLE_TTL_MS, remainingLifetime)));
-    this.idleTimer.unref?.();
+    this.expiryTimer = setTimeout(expire, Math.max(0, remainingLifetime));
+    this.expiryTimer.unref?.();
   }
 
   commit(input: RunClaudeInput, message: NativeMessage): boolean {
@@ -981,7 +992,7 @@ class ClaudeProcess {
 
       for (const block of message.content) {
         if (block.type !== "tool_use") continue;
-        if (!block.name.startsWith("mcp__pi__") || !input.toolNames.has(block.name.slice("mcp__pi__".length))) {
+        if (!block.name.startsWith(TOOL_PREFIX) || !input.toolNames.has(block.name.slice(TOOL_PREFIX.length))) {
           throw new Error("Claude Code returned a tool outside Pi's current tool inventory");
         }
       }
@@ -1028,7 +1039,7 @@ class ClaudeProcess {
   private closeNow(): void {
     if (this.closed) return;
     this.closed = true;
-    this.clearIdleTimer();
+    this.clearExpiryTimer();
     this.relay.abort();
     if (this.child.exitCode === null) killProcessTree(this.child);
   }
@@ -1063,19 +1074,24 @@ async function withManagerLock<T>(operation: () => Promise<T> | T): Promise<T> {
   }
 }
 
-async function expireIdleProcess(sessionId: string, worker: ClaudeProcess): Promise<void> {
+async function expireProcess(sessionId: string, worker: ClaudeProcess): Promise<void> {
   const expired = await withManagerLock(() => {
-    if (
-      processCache.get(sessionId) !== worker ||
-      worker.busy ||
-      !worker.isExpired()
-    ) {
-      return false;
-    }
+    if (processCache.get(sessionId) !== worker || worker.busy || !worker.isExpired()) return false;
     processCache.delete(sessionId);
     return true;
   });
   if (expired) await worker.close();
+}
+
+/** Drop a worker from the warm cache (if it is still there) and close it. */
+async function discardProcess(acquired: AcquiredProcess): Promise<void> {
+  const { sessionId, worker } = acquired;
+  if (sessionId && processCache.get(sessionId) === worker) {
+    await withManagerLock(() => {
+      if (processCache.get(sessionId) === worker) processCache.delete(sessionId);
+    });
+  }
+  await worker.close();
 }
 
 async function acquireProcess(input: RunClaudeInput, plan: ClaudeLaunchPlan): Promise<AcquiredProcess> {
@@ -1083,7 +1099,7 @@ async function acquireProcess(input: RunClaudeInput, plan: ClaudeLaunchPlan): Pr
     const sessionId = input.sessionId;
     const cached = sessionId ? processCache.get(sessionId) : undefined;
     if (cached && !cached.busy) {
-      cached.clearIdleTimer();
+      cached.clearExpiryTimer();
       if (
         cached.isAlive() &&
         !cached.isExpired() &&
@@ -1157,25 +1173,15 @@ export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaude
       processCache.get(acquired.sessionId) === acquired.worker
     ) {
       acquired.worker.busy = false;
-      acquired.worker.armIdleTimer(() => {
-        void expireIdleProcess(acquired.sessionId!, acquired.worker);
+      acquired.worker.armExpiryTimer(() => {
+        void expireProcess(acquired.sessionId!, acquired.worker);
       });
     } else {
-      if (acquired.sessionId && processCache.get(acquired.sessionId) === acquired.worker) {
-        await withManagerLock(() => {
-          if (processCache.get(acquired.sessionId!) === acquired.worker) processCache.delete(acquired.sessionId!);
-        });
-      }
-      await acquired.worker.close();
+      await discardProcess(acquired);
     }
     return output;
   } catch (error) {
-    if (acquired.sessionId && processCache.get(acquired.sessionId) === acquired.worker) {
-      await withManagerLock(() => {
-        if (processCache.get(acquired.sessionId!) === acquired.worker) processCache.delete(acquired.sessionId!);
-      });
-    }
-    await acquired.worker.close();
+    await discardProcess(acquired);
     throw error;
   }
 }

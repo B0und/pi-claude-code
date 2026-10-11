@@ -3,6 +3,8 @@
  * pay-as-you-go usage credits (formerly "extra usage").
  */
 
+import { envFlagEnabled } from "./env.ts";
+
 export const ALLOW_USAGE_CREDITS_ENV = "PI_CLAUDE_CODE_ALLOW_USAGE_CREDITS";
 
 /** Claude Code's `rate_limit_event.rate_limit_info`, as far as this extension relies on it. */
@@ -23,8 +25,7 @@ const USAGE_CREDITS_REJECTION =
   /third-party apps now draw from your extra usage|out of extra usage|draws? from your usage credits/iu;
 
 export function usageCreditsAllowed(env: Record<string, string | undefined>): boolean {
-  const value = env[ALLOW_USAGE_CREDITS_ENV]?.trim().toLowerCase();
-  return !!value && !["0", "false", "no", "off"].includes(value);
+  return envFlagEnabled(env[ALLOW_USAGE_CREDITS_ENV]);
 }
 
 export function usageCreditsChargeError(info: RateLimitInfo): Error {

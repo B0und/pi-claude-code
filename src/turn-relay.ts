@@ -11,6 +11,8 @@ function copy<T>(value: T): T {
 export class AnthropicCapture {
   message?: NativeMessage;
   complete = false;
+  /** Error reported inside an otherwise successful (HTTP 200) event stream. */
+  error?: string;
   private pending = "";
   private readonly decoder = new TextDecoder();
   private readonly argumentsByIndex = new Map<number, string>();
@@ -84,6 +86,11 @@ export class AnthropicCapture {
       case "message_stop":
         this.complete = !!this.message?.stop_reason && this.argumentsByIndex.size === 0;
         break;
+      case "error": {
+        const { type, message } = event.error ?? {};
+        this.error = [type, message].filter(Boolean).join(": ") || "unknown stream error";
+        break;
+      }
     }
   }
 }
@@ -199,6 +206,7 @@ export class TurnRelay {
   }
 
   errorText(): string {
+    if (this.capture.error) return this.capture.error;
     const text = this.errorBody.toString("utf8");
     try {
       const payload = JSON.parse(text) as { error?: { message?: unknown } };

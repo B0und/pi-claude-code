@@ -21,6 +21,7 @@ export interface DiscoveredClaudeModel {
 const BUILTIN_ANTHROPIC_MODELS = ANTHROPIC_MODELS as unknown as Record<string, Model<"anthropic-messages">>;
 const NATIVE_ROUTE_BY_ID = new Map<string, string>();
 const NATIVE_TOOL_CHANGES_BY_ID = new Map<string, boolean>();
+const ADAPTIVE_THINKING_BY_ID = new Map<string, boolean>();
 
 const FALLBACK_DISCOVERY: DiscoveredClaudeModel[] = [
   {
@@ -135,6 +136,7 @@ export function modelFromDiscovery(info: DiscoveredClaudeModel): ClaudeCodeModel
   const builtin = BUILTIN_ANTHROPIC_MODELS[builtinId];
   NATIVE_ROUTE_BY_ID.set(id, info.value);
   NATIVE_TOOL_CHANGES_BY_ID.set(id, builtin?.compat?.supportsMidConvoToolChanges === true);
+  ADAPTIVE_THINKING_BY_ID.set(id, info.supportsAdaptiveThinking === true);
   return builtin ? fromBuiltin(info, id, builtin) : fallbackModel(info, id);
 }
 
@@ -144,22 +146,24 @@ export function nativeModel(model: string): string {
   const direct = NATIVE_ROUTE_BY_ID.get(model);
   if (direct) return direct;
   if (model === "default") return model;
-  const explicitLongContext = model.endsWith("[1m]");
-  const withoutSuffix = withoutContextSuffix(model);
-  const canonical = ALIASES[withoutSuffix] ?? withoutSuffix;
-  return explicitLongContext ? `${canonical}[1m]` : canonical;
+  const canonical = canonicalRoute(model);
+  return model.endsWith("[1m]") ? `${canonical}[1m]` : canonical;
 }
 
-export function supportsAdaptiveThinking(model: string): boolean {
+function canonicalRoute(model: string): string {
   const withoutSuffix = withoutContextSuffix(model);
-  const canonical = ALIASES[withoutSuffix] ?? withoutSuffix;
-  return canonical !== "claude-haiku-4-5-20251001";
+  return ALIASES[withoutSuffix] ?? withoutSuffix;
+}
+
+/** Whether Claude Code reports adaptive thinking for this model. Unknown models are assumed to support it. */
+export function supportsAdaptiveThinking(model: string): boolean {
+  const canonical = canonicalRoute(model);
+  return ADAPTIVE_THINKING_BY_ID.get(model) ?? ADAPTIVE_THINKING_BY_ID.get(canonical) ?? true;
 }
 
 /** Whether Anthropic currently accepts native mid-conversation tool blocks for this route. */
 export function supportsNativeToolChanges(model: string): boolean {
-  const withoutSuffix = withoutContextSuffix(model);
-  const canonical = ALIASES[withoutSuffix] ?? withoutSuffix;
+  const canonical = canonicalRoute(model);
   return (
     NATIVE_TOOL_CHANGES_BY_ID.get(model) ??
     NATIVE_TOOL_CHANGES_BY_ID.get(canonical) ??
