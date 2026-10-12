@@ -1,5 +1,5 @@
 import type { Model } from "@earendil-works/pi-ai";
-import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
+import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 
 export const PROVIDER_ID = "claude-code";
 export const API_ID = "claude-code-stream-json";
@@ -18,7 +18,10 @@ export interface DiscoveredClaudeModel {
   supportsAutoMode?: boolean;
 }
 
-const BUILTIN_ANTHROPIC_MODELS = ANTHROPIC_MODELS as unknown as Record<string, Model<"anthropic-messages">>;
+// Pi exposes providers/all to extensions, but not individual generated model files.
+const BUILTIN_ANTHROPIC_MODELS: Record<string, Model<"anthropic-messages">> = Object.fromEntries(
+  getBuiltinModels("anthropic").map((model) => [model.id, model]),
+);
 const NATIVE_ROUTE_BY_ID = new Map<string, string>();
 const NATIVE_TOOL_CHANGES_BY_ID = new Map<string, boolean>();
 const ADAPTIVE_THINKING_BY_ID = new Map<string, boolean>();
