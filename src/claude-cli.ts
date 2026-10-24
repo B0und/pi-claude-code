@@ -960,6 +960,12 @@ class ClaudeProcess {
       await this.relay.settled();
       input.signal?.throwIfAborted();
 
+      // Checked before the relay outcome: a transient relay error is retryable, and
+      // retrying a request already charged to usage credits would charge it again.
+      if (rateLimit?.isUsingOverage === true && !usageCreditsAllowed({ ...process.env, ...input.env })) {
+        throw usageCreditsChargeError(rateLimit);
+      }
+
       let message: NativeMessage | undefined;
       if (this.relay.used) {
         if (this.relay.status !== 200 || !this.relay.capture.complete || !this.relay.capture.message) {
@@ -1003,12 +1009,6 @@ class ClaudeProcess {
       const usage = message.usage ?? result.usage;
       if (!usage || typeof usage.input_tokens !== "number" || typeof usage.output_tokens !== "number") {
         throw new Error("Claude Code response did not include complete token usage");
-      }
-
-      // The response is already charged at this point, but stopping here keeps
-      // Pi's agent loop from issuing more requests against usage credits.
-      if (rateLimit?.isUsingOverage === true && !usageCreditsAllowed({ ...process.env, ...input.env })) {
-        throw usageCreditsChargeError(rateLimit);
       }
 
       return {
@@ -1178,9 +1178,10 @@ export function incompleteUpstreamMessage(input: IncompleteUpstream): string {
   if (input.failure) detail += `, relay failure ${input.failure}`;
   if (input.denied) detail += `, native retries denied ${input.denied}`;
   if (input.upstreamError) detail += `, upstream said: ${input.upstreamError.slice(0, 500)}`;
-  const lost = input.status === undefined || (input.status === 200 && !input.complete);
-  const transient = lost || input.status! >= 500;
-  return `Incomplete Claude Code upstream response (${detail})${transient ? (lost ? ": connection lost" : ": server error") : ""}`;
+  const status = input.status;
+  const suffix =
+    status === undefined || (status === 200 && !input.complete) ? ": connection lost" : status >= 500 ? ": server error" : "";
+  return `Incomplete Claude Code upstream response (${detail})${suffix}`;
 }
 
 export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaudeOutput> {

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import * as http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -124,6 +125,67 @@ for await (const line of input) {
     assert.equal(allowed.rateLimit?.isUsingOverage, true);
   } finally {
     await closeClaudeProcesses();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stops on usage credits even when the relayed stream was cut off", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "pi-claude-code-billing-relay-")));
+  const executable = join(root, "fake-claude.mjs");
+  await writeFile(
+    executable,
+    `#!/usr/bin/env node
+import readline from "node:readline";
+if (process.argv.includes("auth") && process.argv.includes("status")) {
+  console.log(JSON.stringify({loggedIn: true, authMethod: "claude.ai", subscriptionType: "max"}));
+  process.exit(0);
+}
+const input = readline.createInterface({input: process.stdin, crlfDelay: Infinity});
+for await (const line of input) {
+  const frame = JSON.parse(line);
+  if (frame.type !== "user") continue;
+  const response = await fetch(process.env.ANTHROPIC_BASE_URL + "/v1/messages", {method: "POST", body: "{}"});
+  await response.text();
+  console.log(JSON.stringify({type: "rate_limit_event", rate_limit_info: {
+    status: "allowed_warning", rateLimitType: "five_hour", isUsingOverage: true, overageStatus: "allowed"
+  }}));
+  console.log(JSON.stringify({type: "result", subtype: "success", is_error: false, usage: {input_tokens: 1, output_tokens: 1}}));
+}
+`,
+    "utf8",
+  );
+  await chmod(executable, 0o755);
+  const upstream = http.createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end();
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const address = upstream.address();
+  if (!address || typeof address === "string") throw new Error("missing address");
+
+  try {
+    await assert.rejects(
+      runClaudeRequest({
+        model: "sonnet",
+        cwd: root,
+        frames: [{ type: "user", message: { role: "user", content: [{ type: "text", text: "hi" }] } }],
+        systemPrompt: "system",
+        manifest: [],
+        extraBody: { tools: [] },
+        toolNames: new Set(),
+        env: { PI_CLAUDE_CODE_COMMAND: executable },
+        upstreamUrl: `http://127.0.0.1:${address.port}`,
+        timeoutMs: 5_000,
+      }),
+      (error: Error) => {
+        assert.match(error.message, /^Claude Code billing: .*usage credits/);
+        assert.equal(isRetryableAssistantError(failedMessage(normalizeError(error))), false);
+        return true;
+      },
+    );
+  } finally {
+    await closeClaudeProcesses();
+    upstream.close();
     await rm(root, { recursive: true, force: true });
   }
 });
