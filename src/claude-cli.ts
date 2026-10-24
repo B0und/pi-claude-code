@@ -963,12 +963,15 @@ class ClaudeProcess {
       let message: NativeMessage | undefined;
       if (this.relay.used) {
         if (this.relay.status !== 200 || !this.relay.capture.complete || !this.relay.capture.message) {
-          let detail = `status ${this.relay.status ?? "unknown"}, capture ${this.relay.capture.complete ? "complete" : "incomplete"}`;
-          if (this.relay.failure) detail += `, relay failure ${this.relay.failure}`;
-          if (this.relay.denied) detail += `, native retries denied ${this.relay.denied}`;
-          const upstreamError = this.relay.errorText();
-          if (upstreamError) detail += `, upstream said: ${upstreamError.slice(0, 500)}`;
-          throw new Error(`Incomplete Claude Code upstream response (${detail})`);
+          throw new Error(
+            incompleteUpstreamMessage({
+              status: this.relay.status,
+              complete: this.relay.capture.complete,
+              failure: this.relay.failure,
+              denied: this.relay.denied,
+              upstreamError: this.relay.errorText(),
+            }),
+          );
         }
         message = this.relay.capture.message;
         sawMessageStop = true;
@@ -1158,6 +1161,27 @@ export function cachedClaudeProcessCount(): number {
 registerSessionResourceCleanup((sessionId) => {
   void closeClaudeProcesses(sessionId);
 });
+
+export interface IncompleteUpstream {
+  status?: number;
+  complete: boolean;
+  failure?: string;
+  denied: number;
+  upstreamError?: string;
+}
+
+// Pi's agent-level retry only fires on errors matching its retryable pattern, and
+// CLAUDE_CODE_MAX_RETRIES=0 leaves nothing else to retry a dropped stream. A lost
+// connection (no status, a truncated 200 stream) or a 5xx is transient, so say so.
+export function incompleteUpstreamMessage(input: IncompleteUpstream): string {
+  let detail = `status ${input.status ?? "unknown"}, capture ${input.complete ? "complete" : "incomplete"}`;
+  if (input.failure) detail += `, relay failure ${input.failure}`;
+  if (input.denied) detail += `, native retries denied ${input.denied}`;
+  if (input.upstreamError) detail += `, upstream said: ${input.upstreamError.slice(0, 500)}`;
+  const lost = input.status === undefined || (input.status === 200 && !input.complete);
+  const transient = lost || input.status! >= 500;
+  return `Incomplete Claude Code upstream response (${detail})${transient ? (lost ? ": connection lost" : ": server error") : ""}`;
+}
 
 export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaudeOutput> {
   input.signal?.throwIfAborted();
