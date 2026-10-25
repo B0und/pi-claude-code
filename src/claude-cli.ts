@@ -985,9 +985,12 @@ class ClaudeProcess {
         message = assistants.at(-1);
       }
 
+      if (!message && nativeError) throw new Error(`Claude Code API error: ${nativeError}`);
       if (!message || !sawMessageStop || !result) {
+        // The loop above only exits on a result, so the turn ended without its
+        // message. Nothing permanent was reported, so Pi may retry it.
         throw new Error(
-          `Incomplete Claude Code response: assistant, message_stop and one result required${this.stderr ? ` (${this.stderr.trim().slice(-500)})` : ""}`,
+          `Incomplete Claude Code response: assistant, message_stop and one result required (result ${result?.subtype ?? "missing"}${this.stderr ? `, ${this.stderr.trim().slice(-500)}` : ""}): connection lost`,
         );
       }
 
