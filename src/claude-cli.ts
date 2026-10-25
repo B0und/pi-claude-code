@@ -969,15 +969,13 @@ class ClaudeProcess {
       let message: NativeMessage | undefined;
       if (this.relay.used) {
         if (this.relay.status !== 200 || !this.relay.capture.complete || !this.relay.capture.message) {
-          throw new Error(
-            incompleteUpstreamMessage({
-              status: this.relay.status,
-              complete: this.relay.capture.complete,
-              failure: this.relay.failure,
-              denied: this.relay.denied,
-              upstreamError: this.relay.errorText(),
-            }),
-          );
+          throw incompleteUpstreamError({
+            status: this.relay.status,
+            complete: this.relay.capture.complete,
+            failure: this.relay.failure,
+            denied: this.relay.denied,
+            upstreamError: this.relay.errorText(),
+          });
         }
         message = this.relay.capture.message;
         sawMessageStop = true;
@@ -1217,6 +1215,20 @@ export function nativeApiError(nativeError: string): Error {
     return terminalError(text, "Claude Code API error with a client status; its text is in the claude-code.terminal-failure diagnostic");
   }
   return new Error(text);
+}
+
+// A relay 4xx other than 429 is the upstream's final answer, so it stays
+// terminal even when its text carries a retry word. A 429 rate limit clears
+// within Pi's backoff and costs nothing to retry, so it keeps the retryable
+// message, as do lost streams and 5xx.
+export function incompleteUpstreamError(input: IncompleteUpstream): Error {
+  const full = incompleteUpstreamMessage(input);
+  const status = input.status;
+  if (status === undefined || status < 400 || status >= 500 || status === 429) return new Error(full);
+  return terminalError(
+    full,
+    `Claude Code upstream rejected the request with status ${status}; its text is in the claude-code.terminal-failure diagnostic`,
+  );
 }
 
 // The native loop only ends on a result, so a turn without its message either

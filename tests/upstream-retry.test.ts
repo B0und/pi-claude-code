@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import * as http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -146,4 +147,73 @@ test("Pi does not retry a native plan limit carried on the assistant message", a
   emit({type: "result", subtype: "success", is_error: true, usage});`);
   assert.match(message, /^Claude Code billing: plan or account limit reached/);
   assert.equal(retryable(message), false);
+});
+
+async function relayRun(status: number, message: string): Promise<{ message: string; detail: string }> {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "pi-claude-code-relay-")));
+  const executable = join(root, "fake-claude.mjs");
+  await writeFile(
+    executable,
+    `#!/usr/bin/env node
+import readline from "node:readline";
+if (process.argv.includes("auth") && process.argv.includes("status")) {
+  console.log(JSON.stringify({loggedIn: true, authMethod: "claude.ai", subscriptionType: "max"}));
+  process.exit(0);
+}
+const input = readline.createInterface({input: process.stdin, crlfDelay: Infinity});
+for await (const line of input) {
+  if (JSON.parse(line).type !== "user") continue;
+  const response = await fetch(process.env.ANTHROPIC_BASE_URL + "/v1/messages", {method: "POST", body: "{}"});
+  await response.text();
+  console.log(JSON.stringify({type: "result", subtype: "error_during_execution", is_error: true, usage: {input_tokens: 1, output_tokens: 1}}));
+}
+`,
+    "utf8",
+  );
+  await chmod(executable, 0o755);
+  const upstream = http.createServer((_request, response) => {
+    response.writeHead(status, { "content-type": "application/json" });
+    response.end(JSON.stringify({ type: "error", error: { type: "error", message } }));
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const address = upstream.address();
+  if (!address || typeof address === "string") throw new Error("missing address");
+  try {
+    await runClaudeRequest({
+      model: "sonnet",
+      cwd: root,
+      frames: [{ type: "user", message: { role: "user", content: [{ type: "text", text: "hi" }] } }],
+      systemPrompt: "system",
+      manifest: [],
+      extraBody: { tools: [] },
+      toolNames: new Set(),
+      env: { PI_CLAUDE_CODE_COMMAND: executable },
+      upstreamUrl: `http://127.0.0.1:${address.port}`,
+      timeoutMs: 5_000,
+    });
+    throw new Error("request unexpectedly succeeded");
+  } catch (error) {
+    const text = error instanceof Error ? error.message : String(error);
+    return { message: text, detail: error instanceof ClaudeTerminalError ? error.detail : text };
+  } finally {
+    await closeClaudeProcesses();
+    upstream.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("Pi does not retry a relayed client error, keeping the upstream text", async () => {
+  const { message, detail } = await relayRun(400, "invalid request: timeout must be positive");
+  assert.equal(retryable(message), false, message);
+  assert.match(detail, /status 400.*timeout must be positive/);
+});
+
+test("Pi retries a relayed 429 rate limit and a relayed 5xx", async () => {
+  for (const [status, text] of [
+    [429, "This request would exceed your account's rate limit. Please try again later."],
+    [503, "service unavailable"],
+  ] as const) {
+    const { message } = await relayRun(status, text);
+    assert.equal(retryable(message), true, message);
+  }
 });
