@@ -985,17 +985,12 @@ class ClaudeProcess {
         message = assistants.at(-1);
       }
 
-      if (!message && nativeError) throw new Error(`Claude Code API error: ${nativeError}`);
       if (!message || !sawMessageStop || !result) {
-        // The loop above only exits on a result, so the turn ended without its
-        // message. Nothing permanent was reported, so Pi may retry it.
-        throw new Error(
-          `Incomplete Claude Code response: assistant, message_stop and one result required (result ${result?.subtype ?? "missing"}${this.stderr ? `, ${this.stderr.trim().slice(-500)}` : ""}): connection lost`,
-        );
+        throw new Error(incompleteNativeMessage({ result, nativeError, stderr: this.stderr }));
       }
 
       const nativeFailureHandled = this.relay.denied > 0 || message.stop_reason === "refusal";
-      if (nativeError && !nativeFailureHandled) throw new Error(`Claude Code API error: ${nativeError}`);
+      if (nativeError && !nativeFailureHandled) throw new Error(nativeApiErrorMessage(nativeError));
       const hasTools = message.content.some((block) => block.type === "tool_use");
       const maxTurnsBoundary = hasTools && result.subtype === "error_max_turns";
       if (!maxTurnsBoundary && !nativeFailureHandled && (result.is_error || result.subtype !== "success")) {
@@ -1185,6 +1180,43 @@ export function incompleteUpstreamMessage(input: IncompleteUpstream): string {
   const suffix =
     status === undefined || (status === 200 && !input.complete) ? ": connection lost" : status >= 500 ? ": server error" : "";
   return `Incomplete Claude Code upstream response (${detail})${suffix}`;
+}
+
+const ACCOUNT_LIMIT =
+  /\b429\b|rate.?limit|usage.?limit|hit your limit|limit reached|quota|billing|extra usage|usage credits|out of budget/iu;
+
+// Pi retries any error mentioning 429 or a rate limit, and a plan or account
+// limit does not clear within its retry window. The billing prefix matches
+// Pi's non-retryable pattern, so the turn stops instead of spending retries.
+export function nativeApiErrorMessage(nativeError: string): string {
+  const text = `Claude Code API error: ${nativeError}`;
+  return ACCOUNT_LIMIT.test(nativeError)
+    ? `Claude Code billing: plan or account limit reached, Pi will not retry. ${text}`
+    : text;
+}
+
+// The native loop only ends on a result, so a turn without its message either
+// reported a failure (kept, with its text, as a terminal error) or lost its
+// stream after a successful result (the one transient case Pi should retry).
+export function incompleteNativeMessage(input: {
+  result?: NativeResult;
+  nativeError?: string;
+  stderr: string;
+}): string {
+  if (input.nativeError) return nativeApiErrorMessage(input.nativeError);
+  const result = input.result;
+  const errors = result?.errors;
+  const text = [result?.result, ...(Array.isArray(errors) ? errors : [])]
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .join("; ");
+  const stderr = input.stderr.trim().slice(-500);
+  const detail = `result ${result?.subtype ?? "missing"}${text ? `, ${text.slice(0, 500)}` : ""}${stderr ? `, ${stderr}` : ""}`;
+  const failed = result === undefined || result.is_error === true || result.subtype !== "success" || text.length > 0;
+  if (failed && ACCOUNT_LIMIT.test(text)) {
+    return `Claude Code billing: plan or account limit reached, Pi will not retry. Claude Code request failed (${detail})`;
+  }
+  if (failed) return `Claude Code request failed without a response (${detail})`;
+  return `Incomplete Claude Code response: assistant, message_stop and one result required (${detail}): connection lost`;
 }
 
 export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaudeOutput> {

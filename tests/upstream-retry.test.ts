@@ -106,3 +106,26 @@ test("Pi does not retry a native turn that reported a client error and no messag
   assert.match(message, /^Claude Code API error: API Error: 400/);
   assert.equal(retryable(message), false);
 });
+
+test("Pi does not retry a native turn whose result reports a terminal failure", async () => {
+  const cases = [
+    `emit({type: "result", subtype: "error_during_execution", is_error: true, errors: ["billing: out of extra usage"], usage});`,
+    `emit({type: "result", subtype: "error_during_execution", is_error: true, result: "API Error: 400 invalid request", usage});`,
+    `emit({type: "result", subtype: "success", is_error: true, result: "insufficient_quota", usage});`,
+    `emit({type: "result", subtype: "error_max_turns", is_error: true, num_turns: 0, usage});`,
+    `emit({type: "result", subtype: "success", is_error: true, result: "API Error: 429 You've hit your limit", usage});`,
+  ];
+  for (const script of cases) {
+    const message = await nativeRun(script);
+    assert.equal(retryable(message), false, message);
+    assert.doesNotMatch(message, /connection lost/);
+  }
+});
+
+test("Pi does not retry a native plan limit carried on the assistant message", async () => {
+  const message = await nativeRun(`
+  emit({type: "assistant", error: "rate_limit", message: {id: "m", role: "assistant", content: [{type: "text", text: "API Error: 429 You've hit your limit"}], usage}});
+  emit({type: "result", subtype: "success", is_error: true, usage});`);
+  assert.match(message, /^Claude Code billing: plan or account limit reached/);
+  assert.equal(retryable(message), false);
+});
