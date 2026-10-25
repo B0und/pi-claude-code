@@ -6,7 +6,7 @@ import { delimiter, dirname, extname, isAbsolute, join, resolve } from "node:pat
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { spawn, type ChildProcess } from "node:child_process";
-import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
+import { isRetryableAssistantError, registerSessionResourceCleanup, type AssistantMessage } from "@earendil-works/pi-ai";
 import { TurnRelay } from "./turn-relay.ts";
 import { usageCreditsAllowed, usageCreditsChargeError, type RateLimitInfo } from "./billing.ts";
 import { envFlagEnabled } from "./env.ts";
@@ -986,11 +986,11 @@ class ClaudeProcess {
       }
 
       if (!message || !sawMessageStop || !result) {
-        throw new Error(incompleteNativeMessage({ result, nativeError, stderr: this.stderr }));
+        throw incompleteNativeError({ result, nativeError, stderr: this.stderr });
       }
 
       const nativeFailureHandled = this.relay.denied > 0 || message.stop_reason === "refusal";
-      if (nativeError && !nativeFailureHandled) throw new Error(nativeApiErrorMessage(nativeError));
+      if (nativeError && !nativeFailureHandled) throw nativeApiError(nativeError);
       const hasTools = message.content.some((block) => block.type === "tool_use");
       const maxTurnsBoundary = hasTools && result.subtype === "error_max_turns";
       if (!maxTurnsBoundary && !nativeFailureHandled && (result.is_error || result.subtype !== "success")) {
@@ -1182,28 +1182,48 @@ export function incompleteUpstreamMessage(input: IncompleteUpstream): string {
   return `Incomplete Claude Code upstream response (${detail})${suffix}`;
 }
 
+const TRANSIENT_SERVER = /(?<![a-z0-9])5\d\d(?![a-z0-9])|overloaded/iu;
 const ACCOUNT_LIMIT =
-  /\b429\b|rate.?limit|usage.?limit|hit your limit|limit reached|quota|billing|extra usage|usage credits|out of budget/iu;
+  /(?<![a-z0-9])429(?![a-z0-9])|usage.?limit|hit your limit|limit reached|plan limit|quota|billing|extra usage|usage credits|out of budget/iu;
+const CLIENT_STATUS = /(?<![a-z0-9])4\d\d(?![a-z0-9])/u;
+const ACCOUNT_PREFIX = "Claude Code billing: plan or account limit reached.";
 
-// Pi retries any error mentioning 429 or a rate limit, and a plan or account
-// limit does not clear within its retry window. The billing prefix matches
-// Pi's non-retryable pattern, so the turn stops instead of spending retries.
-export function nativeApiErrorMessage(nativeError: string): string {
+export class ClaudeTerminalError extends Error {
+  readonly detail: string;
+
+  constructor(message: string, detail: string) {
+    super(message);
+    this.name = "ClaudeTerminalError";
+    this.detail = detail;
+  }
+}
+
+// Pi decides retries from the message text alone, so a terminal failure whose
+// own text happens to contain a retry word ("timeout", "server error") would be
+// retried. Keep the text in `detail` and give Pi a message it will not retry.
+function terminalError(full: string, short: string): ClaudeTerminalError {
+  const retried = isRetryableAssistantError({ stopReason: "error", errorMessage: full } as AssistantMessage);
+  return new ClaudeTerminalError(retried ? short : full, full);
+}
+
+// A plan or account limit does not clear within Pi's retry window, and Pi's
+// retry pattern matches 429 and rate-limit text, so it gets the billing prefix
+// Pi never retries. A 5xx stays retryable even when it mentions rate limiting.
+export function nativeApiError(nativeError: string): Error {
   const text = `Claude Code API error: ${nativeError}`;
-  return ACCOUNT_LIMIT.test(nativeError)
-    ? `Claude Code billing: plan or account limit reached, Pi will not retry. ${text}`
-    : text;
+  if (TRANSIENT_SERVER.test(nativeError)) return new Error(text);
+  if (ACCOUNT_LIMIT.test(nativeError)) return new ClaudeTerminalError(`${ACCOUNT_PREFIX} ${text}`, text);
+  if (CLIENT_STATUS.test(nativeError)) {
+    return terminalError(text, "Claude Code API error with a client status; its text is in the claude-code.terminal-failure diagnostic");
+  }
+  return new Error(text);
 }
 
 // The native loop only ends on a result, so a turn without its message either
-// reported a failure (kept, with its text, as a terminal error) or lost its
-// stream after a successful result (the one transient case Pi should retry).
-export function incompleteNativeMessage(input: {
-  result?: NativeResult;
-  nativeError?: string;
-  stderr: string;
-}): string {
-  if (input.nativeError) return nativeApiErrorMessage(input.nativeError);
+// reported a failure, which keeps its text, or lost its stream after a
+// successful result, the one transient case Pi should retry.
+export function incompleteNativeError(input: { result?: NativeResult; nativeError?: string; stderr: string }): Error {
+  if (input.nativeError) return nativeApiError(input.nativeError);
   const result = input.result;
   const errors = result?.errors;
   const text = [result?.result, ...(Array.isArray(errors) ? errors : [])]
@@ -1212,11 +1232,13 @@ export function incompleteNativeMessage(input: {
   const stderr = input.stderr.trim().slice(-500);
   const detail = `result ${result?.subtype ?? "missing"}${text ? `, ${text.slice(0, 500)}` : ""}${stderr ? `, ${stderr}` : ""}`;
   const failed = result === undefined || result.is_error === true || result.subtype !== "success" || text.length > 0;
-  if (failed && ACCOUNT_LIMIT.test(text)) {
-    return `Claude Code billing: plan or account limit reached, Pi will not retry. Claude Code request failed (${detail})`;
+  if (!failed) {
+    return new Error(`Incomplete Claude Code response: assistant, message_stop and one result required (${detail}): connection lost`);
   }
-  if (failed) return `Claude Code request failed without a response (${detail})`;
-  return `Incomplete Claude Code response: assistant, message_stop and one result required (${detail}): connection lost`;
+  const full = `Claude Code request failed without a response (${detail})`;
+  if (TRANSIENT_SERVER.test(text)) return new Error(full);
+  if (ACCOUNT_LIMIT.test(text)) return new ClaudeTerminalError(`${ACCOUNT_PREFIX} ${full}`, full);
+  return terminalError(full, "Claude Code request failed without a response; its text is in the claude-code.terminal-failure diagnostic");
 }
 
 export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaudeOutput> {

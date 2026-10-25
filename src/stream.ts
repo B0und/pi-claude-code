@@ -16,7 +16,7 @@ import {
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { describeUsageCreditsRejection } from "./billing.ts";
-import { runClaudeRequest } from "./claude-cli.ts";
+import { ClaudeTerminalError, runClaudeRequest } from "./claude-cli.ts";
 import { nativeModel, supportsNativeToolChanges } from "./model-catalog.ts";
 import type { AnthropicStreamEvent, NativeContentBlock, NativeMessage, NativeUsage } from "./native-types.ts";
 import {
@@ -422,6 +422,12 @@ export function streamClaudeCode(
     } catch (error) {
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = normalizeError(error);
+      if (error instanceof ClaudeTerminalError && error.detail !== error.message) {
+        output.diagnostics = [
+          ...(output.diagnostics ?? []),
+          { type: "claude-code.terminal-failure", timestamp: Date.now(), details: { text: error.detail } as never },
+        ];
+      }
       for (const block of output.content) {
         delete (block as Partial<IndexedBlock>).nativeIndex;
         delete (block as Partial<IndexedToolCall>).partialJson;

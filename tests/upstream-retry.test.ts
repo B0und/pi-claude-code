@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { isRetryableAssistantError, type AssistantMessage } from "@earendil-works/pi-ai";
-import { closeClaudeProcesses, incompleteUpstreamMessage, runClaudeRequest } from "../src/claude-cli.ts";
+import { ClaudeTerminalError, closeClaudeProcesses, incompleteUpstreamMessage, runClaudeRequest } from "../src/claude-cli.ts";
 import { normalizeError } from "../src/stream.ts";
 
 function retryable(errorMessage: string): boolean {
@@ -48,7 +48,7 @@ test("Pi does not retry an upstream client error", () => {
   assert.equal(retryable(message), false);
 });
 
-async function nativeRun(script: string): Promise<string> {
+async function nativeRun(script: string): Promise<{ message: string; detail: string }> {
   const root = await realpath(await mkdtemp(join(tmpdir(), "pi-claude-code-native-")));
   const executable = join(root, "fake-claude.mjs");
   await writeFile(
@@ -84,46 +84,64 @@ for await (const line of input) {
     });
     throw new Error("request unexpectedly succeeded");
   } catch (error) {
-    return error instanceof Error ? error.message : String(error);
+    const message = error instanceof Error ? error.message : String(error);
+    return { message, detail: error instanceof ClaudeTerminalError ? error.detail : message };
   } finally {
     await closeClaudeProcesses();
     await rm(root, { recursive: true, force: true });
   }
 }
 
+const complete = (text: string) => `
+  emit({type: "stream_event", event: {type: "message_start", message: {id: "m", role: "assistant", content: [], usage}}});
+  emit({type: "assistant", error: "server_error", message: {id: "m", role: "assistant", content: [{type: "text", text: ${JSON.stringify(text)}}], usage}});
+  emit({type: "assistant", message: {id: "m", role: "assistant", content: [{type: "text", text: "partial"}], stop_reason: "end_turn", usage}});
+  emit({type: "stream_event", event: {type: "message_stop"}});
+  emit({type: "result", subtype: "error_during_execution", is_error: true, usage});`;
+
 test("Pi retries a native turn whose stream ended before its message", async () => {
-  const message = await nativeRun(`
+  const { message } = await nativeRun(`
   emit({type: "stream_event", event: {type: "message_start", message: {id: "m", role: "assistant", content: [], usage}}});
   emit({type: "result", subtype: "success", is_error: false, usage});`);
   assert.match(message, /^Incomplete Claude Code response: assistant, message_stop and one result required/);
   assert.equal(retryable(message), true);
 });
 
+test("Pi retries a native 5xx even when it mentions rate limiting", async () => {
+  const { message } = await nativeRun(complete("API Error: 503 server-side rate limit; please retry your request"));
+  assert.match(message, /^Claude Code API error: API Error: 503/);
+  assert.equal(retryable(message), true);
+});
+
 test("Pi does not retry a native turn that reported a client error and no message", async () => {
-  const message = await nativeRun(`
+  const { message, detail } = await nativeRun(`
   emit({type: "assistant", error: "invalid_request", message: {id: "m", role: "assistant", content: [{type: "text", text: "API Error: 400 invalid request"}], usage}});
   emit({type: "result", subtype: "success", is_error: true, usage});`);
-  assert.match(message, /^Claude Code API error: API Error: 400/);
+  assert.match(detail, /API Error: 400 invalid request/);
   assert.equal(retryable(message), false);
 });
 
-test("Pi does not retry a native turn whose result reports a terminal failure", async () => {
-  const cases = [
-    `emit({type: "result", subtype: "error_during_execution", is_error: true, errors: ["billing: out of extra usage"], usage});`,
-    `emit({type: "result", subtype: "error_during_execution", is_error: true, result: "API Error: 400 invalid request", usage});`,
-    `emit({type: "result", subtype: "success", is_error: true, result: "insufficient_quota", usage});`,
-    `emit({type: "result", subtype: "error_max_turns", is_error: true, num_turns: 0, usage});`,
-    `emit({type: "result", subtype: "success", is_error: true, result: "API Error: 429 You've hit your limit", usage});`,
+test("Pi does not retry a terminal native failure, keeping its text, even when it contains a retry word", async () => {
+  const cases: Array<[string, RegExp]> = [
+    [`emit({type: "result", subtype: "error_during_execution", is_error: true, errors: ["billing: out of extra usage"], usage});`, /out of extra usage/],
+    [`emit({type: "result", subtype: "error_during_execution", is_error: true, result: "API Error: 400 invalid request", usage});`, /400 invalid request/],
+    [`emit({type: "result", subtype: "success", is_error: true, result: "insufficient_quota", usage});`, /insufficient_quota/],
+    [`emit({type: "result", subtype: "error_max_turns", is_error: true, num_turns: 0, usage});`, /error_max_turns/],
+    [`emit({type: "result", subtype: "success", is_error: true, result: "API Error: 429 You've hit your limit", usage});`, /hit your limit/],
+    [`emit({type: "result", subtype: "error_during_execution", is_error: true, result: "API Error: 400 invalid request: timeout must be positive", usage});`, /timeout must be positive/],
   ];
-  for (const script of cases) {
-    const message = await nativeRun(script);
+  for (const [script, text] of cases) {
+    const { message, detail } = await nativeRun(script);
     assert.equal(retryable(message), false, message);
     assert.doesNotMatch(message, /connection lost/);
+    assert.match(detail, text);
   }
+  const { message } = await nativeRun(complete("API Error: 400 invalid request: timeout must be positive"));
+  assert.equal(retryable(message), false, message);
 });
 
 test("Pi does not retry a native plan limit carried on the assistant message", async () => {
-  const message = await nativeRun(`
+  const { message } = await nativeRun(`
   emit({type: "assistant", error: "rate_limit", message: {id: "m", role: "assistant", content: [{type: "text", text: "API Error: 429 You've hit your limit"}], usage}});
   emit({type: "result", subtype: "success", is_error: true, usage});`);
   assert.match(message, /^Claude Code billing: plan or account limit reached/);
